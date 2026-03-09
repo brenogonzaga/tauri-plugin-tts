@@ -273,7 +273,6 @@ sudo pacman -S speech-dispatcher
 2. Install "Google Text-to-Speech" from Play Store if missing
 3. Download language data for your desired languages
 
-
 ### iOS: Voices sound robotic
 
 **Solution:** Download enhanced voices:
@@ -296,19 +295,6 @@ sudo pacman -S speech-dispatcher
 ## Examples
 
 See the [examples/tts-example](./examples/tts-example) directory for a complete working demo with React + Material UI.
-
-### Building
-
-```bash
-# Build Rust
-cargo build
-
-# Build TypeScript
-npm run build
-
-# Run tests
-cargo test
-```
 
 ## License
 

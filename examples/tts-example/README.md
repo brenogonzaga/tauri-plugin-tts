@@ -17,6 +17,25 @@ Complete demonstration of the `tauri-plugin-tts` functionality using React + Typ
 
 ## Running the Example
 
+**Before running the example**, build the plugin from the root directory:
+
+```bash
+# From the tauri-plugin-tts root directory
+npm run build
+```
+
+**For mobile platforms**, initialize before running:
+
+```bash
+# For Android
+npm run android init
+
+# For iOS
+npm run ios init
+```
+
+**Then run the example**:
+
 ```bash
 npm install
 npm run tauri dev
@@ -50,7 +69,7 @@ const voicesByLanguage = voices.reduce(
     acc[lang].push(voice);
     return acc;
   },
-  {} as Record<string, Voice[]>
+  {} as Record<string, Voice[]>,
 );
 ```
 
