@@ -88,7 +88,7 @@ pub fn init<R: Runtime, C: DeserializeOwned>(
         {
             let err_msg = e.to_string();
             if err_msg.contains("speech-dispatcher") || err_msg.contains("Speech Dispatcher") {
-                return crate::Error::TtsEngineError(
+                return crate::Error::OperationFailed(
                     "Speech Dispatcher not available. Please install it:\n\
                     Ubuntu/Debian: sudo apt install speech-dispatcher\n\
                     Fedora: sudo dnf install speech-dispatcher\n\
