@@ -100,8 +100,6 @@ pub enum ValidationError {
     TextTooLong { len: usize, max: usize },
     #[error("Voice ID too long: {len} chars (max: {max})")]
     VoiceIdTooLong { len: usize, max: usize },
-    #[error("Invalid voice ID format - only alphanumeric, dots, underscores, and hyphens allowed")]
-    InvalidVoiceId,
     #[error("Language code too long: {len} chars (max: {max})")]
     LanguageTooLong { len: usize, max: usize },
 }
@@ -130,13 +128,6 @@ impl SpeakRequest {
             });
         }
 
-        // Voice ID validation (if provided)
-        let sanitized_voice_id = self
-            .voice_id
-            .as_ref()
-            .map(|id| Self::validate_voice_id(id))
-            .transpose()?;
-
         // Language validation (if provided)
         let sanitized_language = self
             .language
@@ -147,28 +138,12 @@ impl SpeakRequest {
         Ok(ValidatedSpeakRequest {
             text: self.text.clone(),
             language: sanitized_language,
-            voice_id: sanitized_voice_id,
+            voice_id: self.voice_id.clone(),
             rate: self.rate.clamp(0.1, 4.0),
             pitch: self.pitch.clamp(0.5, 2.0),
             volume: self.volume.clamp(0.0, 1.0),
             queue_mode: self.queue_mode,
         })
-    }
-
-    fn validate_voice_id(id: &str) -> Result<String, ValidationError> {
-        if id.len() > MAX_VOICE_ID_LENGTH {
-            return Err(ValidationError::VoiceIdTooLong {
-                len: id.len(),
-                max: MAX_VOICE_ID_LENGTH,
-            });
-        }
-        if !id
-            .chars()
-            .all(|c| c.is_alphanumeric() || c == '.' || c == '_' || c == '-')
-        {
-            return Err(ValidationError::InvalidVoiceId);
-        }
-        Ok(id.to_string())
     }
 
     fn validate_language(lang: &str) -> Result<String, ValidationError> {
@@ -271,9 +246,6 @@ impl PreviewVoiceRequest {
     }
 
     pub fn validate(&self) -> Result<(), ValidationError> {
-        // Validate voice_id
-        SpeakRequest::validate_voice_id(&self.voice_id)?;
-
         // Validate custom text if provided
         if let Some(ref text) = self.text {
             if text.is_empty() {
@@ -413,27 +385,7 @@ mod tests {
             Some("com.apple.voice.enhanced.en-US".to_string())
         );
     }
-
-    #[test]
-    fn test_validation_invalid_voice_id_special_chars() {
-        let request = SpeakRequest {
-            text: "Hello".to_string(),
-            language: None,
-            voice_id: Some("voice'; DROP TABLE--".to_string()),
-            rate: 1.0,
-            pitch: 1.0,
-            volume: 1.0,
-            queue_mode: QueueMode::Flush,
-        };
-
-        let result = request.validate();
-        assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            ValidationError::InvalidVoiceId
-        ));
-    }
-
+    
     #[test]
     fn test_validation_voice_id_too_long() {
         let long_voice_id = "x".repeat(MAX_VOICE_ID_LENGTH + 1);
