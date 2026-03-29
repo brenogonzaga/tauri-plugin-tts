@@ -301,3 +301,33 @@ export async function previewVoice(options: PreviewVoiceOptions): Promise<void> 
     },
   });
 }
+
+/**
+ * Set whether TTS should continue speaking when the app goes to background or the screen locks.
+ *
+ * When `continueInBackground` is `true` (default), speech continues uninterrupted.
+ * When `false`, speech is paused when the app goes to background and a `speech:backgroundPause`
+ * event is emitted.
+ *
+ * Desktop: no-op (always resolves successfully).
+ *
+ * @example
+ * ```typescript
+ * import { setBackgroundBehavior } from "tauri-plugin-tts-api";
+ *
+ * // Pause speech when screen locks (e.g., app only makes sense in foreground)
+ * await setBackgroundBehavior({ continueInBackground: false });
+ *
+ * // Allow speech to continue in background (default)
+ * await setBackgroundBehavior({ continueInBackground: true });
+ * ```
+ */
+export async function setBackgroundBehavior(options: {
+  continueInBackground: boolean;
+}): Promise<void> {
+  await invoke("plugin:tts|set_background_behavior", {
+    payload: {
+      continueInBackground: options.continueInBackground,
+    },
+  });
+}

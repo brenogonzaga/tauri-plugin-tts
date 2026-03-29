@@ -130,11 +130,16 @@ class PreviewVoiceArgs: Decodable {
     }
 }
 
+class SetBackgroundBehaviorArgs: Decodable {
+    let continueInBackground: Bool
+}
+
 class TtsPlugin: Plugin, AVSpeechSynthesizerDelegate {
     private let synthesizer = AVSpeechSynthesizer()
     private var currentUtteranceId: String?
     private var wasInterrupted: Bool = false
     private var isInForeground: Bool = true
+    private var continueInBackground: Bool = true
     private var voiceCache: [AVSpeechSynthesisVoice]?
     private var voiceCacheTimestamp: Date?
     private let voiceCacheTTL: TimeInterval = 60.0
@@ -189,14 +194,21 @@ class TtsPlugin: Plugin, AVSpeechSynthesizerDelegate {
     }
     
     @objc private func handleAppDidEnterBackground() {
-        NSLog("[TtsPlugin] App entered background")
+        NSLog("[TtsPlugin] App entered background (continueInBackground=\(continueInBackground))")
         isInForeground = false
         
-        // Pause speech when entering background (unless background audio is enabled)
         if synthesizer.isSpeaking && !synthesizer.isPaused {
-            synthesizer.pauseSpeaking(at: .word)
-            NSLog("[TtsPlugin]   Speech paused due to background transition")
-            trigger("speech:backgroundPause", data: JSObject())
+            if continueInBackground {
+                // Continue speaking — AVAudioSession .playback category supports background audio.
+                // Notify JS so it can update UI state if needed.
+                NSLog("[TtsPlugin]   App going to background while speaking — continuing in background")
+                trigger("speech:backgroundPause", data: JSObject())
+            } else {
+                // User opted out of background audio — pause and notify JS.
+                NSLog("[TtsPlugin]   App going to background while speaking — pausing (continueInBackground=false)")
+                synthesizer.pauseSpeaking(at: .word)
+                trigger("speech:backgroundPause", data: JSObject())
+            }
         }
     }
     
@@ -564,6 +576,13 @@ class TtsPlugin: Plugin, AVSpeechSynthesizerDelegate {
         
         synthesizer.speak(utterance)
         NSLog("[TtsPlugin]   Preview started")
+        invoke.resolve(["success": true])
+    }
+
+    @objc public func setBackgroundBehavior(_ invoke: Invoke) throws {
+        let args = try invoke.parseArgs(SetBackgroundBehaviorArgs.self)
+        continueInBackground = args.continueInBackground
+        NSLog("[TtsPlugin] setBackgroundBehavior() continueInBackground=\(continueInBackground)")
         invoke.resolve(["success": true])
     }
 }

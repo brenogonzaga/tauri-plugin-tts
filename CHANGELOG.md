@@ -5,6 +5,30 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.6] - 2026-03-29
+
+### Fixed
+
+- **Android** (issue #7): TTS no longer stops when the screen is locked or the app goes to
+  background. Previously `onPause()` explicitly called `tts.stop()` without emitting any
+  event, leaving the JS side with no way to detect the interruption and no audio. Now speech
+  continues uninterrupted in the background (TTS engine runs as a system service). When the
+  app goes to background while speaking, a `speech:backgroundPause` event is emitted so the
+  UI can update its state. Audio focus changes (phone calls, notifications) continue to be
+  handled separately via `AudioManager.OnAudioFocusChangeListener`.
+- **iOS** (issue #7): Same fix applied — `AVSpeechSynthesizer` no longer pauses when the
+  screen locks. The `AVAudioSession` category `.playback` already enables background audio;
+  the explicit `pauseSpeaking()` call on background transition was removed. A
+  `speech:backgroundPause` event is still emitted so the UI can update its state.
+- **Android**: `speak()` with large texts no longer emits `speech:finish` prematurely. On
+  Android 14+ (API 34+), `isSpeaking()` returns `false` as soon as synthesis is handed to the
+  hardware audio buffer — before playback actually completes. The previous single-poll check
+  fired `speech:finish` ~2 seconds into a long utterance. Fixed with a debounce: 15
+  consecutive `isSpeaking() == false` readings (1.5s of confirmed silence) are now required
+  before emitting `speech:finish`.
+- **Android**: `volume` parameter in `speak()` was accepted but silently ignored. It is now
+  correctly passed via `TextToSpeech.Engine.KEY_PARAM_VOLUME` in the Bundle.
+
 ## [0.1.5] - 2026-03-30
 
 ### Fixed

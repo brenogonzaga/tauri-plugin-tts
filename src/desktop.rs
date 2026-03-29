@@ -371,4 +371,12 @@ impl<R: Runtime> Tts<R> {
         };
         self.speak(speak_request)
     }
+
+    pub fn set_background_behavior(
+        &self,
+        _payload: SetBackgroundBehaviorRequest,
+    ) -> crate::Result<SetBackgroundBehaviorResponse> {
+        // Desktop has no background/foreground concept — no-op
+        Ok(SetBackgroundBehaviorResponse { success: true })
+    }
 }

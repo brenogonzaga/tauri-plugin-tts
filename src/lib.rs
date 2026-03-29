@@ -42,7 +42,8 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
             commands::is_initialized,
             commands::pause_speaking,
             commands::resume_speaking,
-            commands::preview_voice
+            commands::preview_voice,
+            commands::set_background_behavior
         ])
         .setup(|app, api| {
             #[cfg(mobile)]

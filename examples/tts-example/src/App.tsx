@@ -20,14 +20,15 @@ import {
   speak,
   stop,
   getVoices,
-  isSpeaking as guestIsSpeaking,
   isInitialized,
+  onSpeechEvent,
   type Voice,
 } from "tauri-plugin-tts-api";
+import type { UnlistenFn } from "@tauri-apps/api/event";
 
 export default function App() {
   const [text, setText] = useState(
-    "Hello! This is a test of the text-to-speech plugin. This sentence is longer to ensure we can hear the audio."
+    "Hello! This is a test of the text-to-speech plugin. This sentence is longer to ensure we can hear the audio.",
   );
   const [selectedVoiceId, setSelectedVoiceId] = useState("");
   const [rate, setRate] = useState(1.0);
@@ -39,8 +40,8 @@ export default function App() {
   const [ttsReady, setTtsReady] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
-  const pollingRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const initCheckRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const speechUnlistenRef = useRef<UnlistenFn | null>(null);
 
   const waitForTtsInit = useCallback(async (): Promise<boolean> => {
     for (let i = 0; i < 20; i++) {
@@ -76,42 +77,46 @@ export default function App() {
     initAndLoad();
 
     return () => {
-      if (pollingRef.current) {
-        clearInterval(pollingRef.current);
-      }
       if (initCheckRef.current) {
         clearInterval(initCheckRef.current);
       }
+      speechUnlistenRef.current?.();
     };
   }, [waitForTtsInit]);
 
-  // Start polling for speaking status (only when speaking starts)
-  const startPolling = () => {
-    if (pollingRef.current) return;
+  // Register speech event listeners. speech:finish and speech:error both signal end of speech.
+  // Using onSpeechEvent (instead of polling isSpeaking()) is reliable for network voices:
+  // engine.isSpeaking returns false when synthesis hands off to the hardware audio buffer,
+  // but audio may still be playing. The plugin's speech:finish uses a 1.5s debounce to
+  // correctly detect when playback is truly done.
+  const startSpeechListeners = async () => {
+    speechUnlistenRef.current?.();
 
-    setIsSpeaking(true); // Optimistic update
+    const [unlistenFinish, unlistenError, unlistenCancel] = await Promise.all([
+      onSpeechEvent("speech:finish", () => {
+        setIsSpeaking(false);
+        speechUnlistenRef.current = null;
+      }),
+      onSpeechEvent("speech:error", () => {
+        setIsSpeaking(false);
+        speechUnlistenRef.current = null;
+      }),
+      onSpeechEvent("speech:cancel", () => {
+        setIsSpeaking(false);
+        speechUnlistenRef.current = null;
+      }),
+    ]);
 
-    pollingRef.current = setInterval(async () => {
-      try {
-        const speaking = await guestIsSpeaking();
-        setIsSpeaking(speaking);
-
-        if (!speaking && pollingRef.current) {
-          clearInterval(pollingRef.current);
-          pollingRef.current = null;
-        }
-      } catch {
-        // Ignore errors in polling
-      }
-    }, 500);
+    speechUnlistenRef.current = () => {
+      unlistenFinish();
+      unlistenError();
+      unlistenCancel();
+    };
   };
 
-  // Stop polling manually
-  const stopPolling = () => {
-    if (pollingRef.current) {
-      clearInterval(pollingRef.current);
-      pollingRef.current = null;
-    }
+  const stopSpeechListeners = () => {
+    speechUnlistenRef.current?.();
+    speechUnlistenRef.current = null;
     setIsSpeaking(false);
   };
 
@@ -138,19 +143,21 @@ export default function App() {
   const handleSpeak = async () => {
     setError(null);
     try {
+      await startSpeechListeners();
       await speak({
-          text,
-          voiceId: selectedVoiceId || null,
-          rate,
-          pitch,
-          volume,
-          language: null,
-          queueMode: null
+        text,
+        voiceId: selectedVoiceId || null,
+        rate,
+        pitch,
+        volume,
+        language: null,
+        queueMode: null,
       });
-      startPolling(); // Start polling only when speaking starts
+      setIsSpeaking(true);
       setSuccess("Speaking started!");
       setTimeout(() => setSuccess(null), 2000);
     } catch (err) {
+      stopSpeechListeners();
       setError(`Failed to speak: ${err}`);
     }
   };
@@ -159,7 +166,7 @@ export default function App() {
     setError(null);
     try {
       await stop();
-      stopPolling(); // Stop polling immediately
+      stopSpeechListeners();
       setSuccess("Speech stopped");
       setTimeout(() => setSuccess(null), 2000);
     } catch (err) {
@@ -175,7 +182,7 @@ export default function App() {
       acc[lang].push(voice);
       return acc;
     },
-    {} as Record<string, Voice[]>
+    {} as Record<string, Voice[]>,
   );
 
   return (
@@ -220,11 +227,7 @@ export default function App() {
       )}
 
       {success && (
-        <Alert
-          severity="success"
-          sx={{ mb: 2 }}
-          onClose={() => setSuccess(null)}
-        >
+        <Alert severity="success" sx={{ mb: 2 }} onClose={() => setSuccess(null)}>
           {success}
         </Alert>
       )}
@@ -236,7 +239,7 @@ export default function App() {
           multiline
           rows={3}
           value={text}
-          onChange={e => setText(e.target.value)}
+          onChange={(e) => setText(e.target.value)}
           fullWidth
         />
 
@@ -246,7 +249,7 @@ export default function App() {
           <Select
             value={selectedVoiceId}
             label="Voice"
-            onChange={e => setSelectedVoiceId(e.target.value)}
+            onChange={(e) => setSelectedVoiceId(e.target.value)}
           >
             <MenuItem value="">
               <em>System Default</em>
@@ -259,7 +262,7 @@ export default function App() {
               >
                 {lang.toUpperCase()} ({langVoices.length} voices)
               </MenuItem>,
-              ...langVoices.map(voice => (
+              ...langVoices.map((voice) => (
                 <MenuItem key={voice.id} value={voice.id} sx={{ pl: 4 }}>
                   {voice.name}
                 </MenuItem>
@@ -270,10 +273,7 @@ export default function App() {
 
         {/* Rate slider */}
         <Box>
-          <Typography
-            gutterBottom
-            sx={{ fontSize: { xs: "0.875rem", sm: "1rem" } }}
-          >
+          <Typography gutterBottom sx={{ fontSize: { xs: "0.875rem", sm: "1rem" } }}>
             Rate: {rate.toFixed(2)}x
           </Typography>
           <Slider
@@ -298,10 +298,7 @@ export default function App() {
 
         {/* Pitch slider */}
         <Box>
-          <Typography
-            gutterBottom
-            sx={{ fontSize: { xs: "0.875rem", sm: "1rem" } }}
-          >
+          <Typography gutterBottom sx={{ fontSize: { xs: "0.875rem", sm: "1rem" } }}>
             Pitch: {pitch.toFixed(1)}
           </Typography>
           <Slider
@@ -325,10 +322,7 @@ export default function App() {
 
         {/* Volume slider */}
         <Box>
-          <Typography
-            gutterBottom
-            sx={{ fontSize: { xs: "0.875rem", sm: "1rem" } }}
-          >
+          <Typography gutterBottom sx={{ fontSize: { xs: "0.875rem", sm: "1rem" } }}>
             Volume: {Math.round(volume * 100)}%
           </Typography>
           <Slider
@@ -400,14 +394,10 @@ export default function App() {
             alignItems="center"
             sx={{ mb: 2 }}
           >
-            <Typography variant="h6">
-              Available Voices ({voices.length})
-            </Typography>
+            <Typography variant="h6">Available Voices ({voices.length})</Typography>
             <Button
               size="small"
-              startIcon={
-                loading ? <CircularProgress size={16} /> : <MdRefresh />
-              }
+              startIcon={loading ? <CircularProgress size={16} /> : <MdRefresh />}
               onClick={loadVoices}
               disabled={loading}
             >
@@ -427,7 +417,7 @@ export default function App() {
                 <Typography variant="subtitle2" color="primary">
                   {lang.toUpperCase()} ({langVoices.length})
                 </Typography>
-                {langVoices.slice(0, 5).map(voice => (
+                {langVoices.slice(0, 5).map((voice) => (
                   <Button
                     key={voice.id}
                     variant="text"
@@ -437,23 +427,15 @@ export default function App() {
                       pl: 2,
                       justifyContent: "flex-start",
                       textTransform: "none",
-                      fontWeight:
-                        selectedVoiceId === voice.id ? "bold" : "normal",
-                      color:
-                        selectedVoiceId === voice.id
-                          ? "primary.main"
-                          : "text.primary",
+                      fontWeight: selectedVoiceId === voice.id ? "bold" : "normal",
+                      color: selectedVoiceId === voice.id ? "primary.main" : "text.primary",
                     }}
                   >
                     • {voice.name} ({voice.language})
                   </Button>
                 ))}
                 {langVoices.length > 5 && (
-                  <Typography
-                    variant="caption"
-                    sx={{ pl: 2 }}
-                    color="text.secondary"
-                  >
+                  <Typography variant="caption" sx={{ pl: 2 }} color="text.secondary">
                     ... and {langVoices.length - 5} more
                   </Typography>
                 )}
@@ -479,7 +461,7 @@ export default function App() {
               { lang: "fr", text: "Bonjour! Comment allez-vous?" },
               { lang: "de", text: "Hallo! Wie geht es Ihnen?" },
               { lang: "ja", text: "こんにちは！お元気ですか？" },
-            ].map(sample => {
+            ].map((sample) => {
               // Find first voice for this language
               const langVoices = voicesByLanguage[sample.lang] || [];
               const firstVoice = langVoices[0];

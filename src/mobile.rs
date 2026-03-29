@@ -68,4 +68,13 @@ impl<R: Runtime> Tts<R> {
             .run_mobile_plugin("previewVoice", payload)
             .map_err(Into::into)
     }
+
+    pub fn set_background_behavior(
+        &self,
+        payload: SetBackgroundBehaviorRequest,
+    ) -> crate::Result<SetBackgroundBehaviorResponse> {
+        self.0
+            .run_mobile_plugin("setBackgroundBehavior", payload)
+            .map_err(Into::into)
+    }
 }

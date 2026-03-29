@@ -44,6 +44,11 @@ class PreviewVoiceArgs {
     fun sampleText(): String = text ?: "Hello! This is a sample of how this voice sounds."
 }
 
+@InvokeArg
+class SetBackgroundBehaviorArgs {
+    var continueInBackground: Boolean = true
+}
+
 /** Maximum text length allowed (10KB) */
 private const val MAX_TEXT_LENGTH = 10_000
 
@@ -93,6 +98,7 @@ class TtsPlugin(private val activity: Activity) : Plugin(activity), TextToSpeech
     private var tts: TextToSpeech? = null
     private var isInitialized = false
     private var isForeground = true
+    private var continueInBackground = true
     private var isPaused = false
     private val pendingRequests = ConcurrentLinkedQueue<PendingSpeak>()
     private var audioManager: AudioManager? = null
@@ -281,6 +287,12 @@ class TtsPlugin(private val activity: Activity) : Plugin(activity), TextToSpeech
     
     private fun requestAudioFocus(): Boolean {
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+            // AUDIOFOCUS_GAIN_TRANSIENT: correct type for TTS/navigation speech.
+            // The Google TTS engine runs as a separate service and also requests audio focus
+            // internally to play back synthesized audio. Using AUDIOFOCUS_GAIN (permanent)
+            // causes a conflict: when the TTS service requests its own focus, the system sends
+            // AUDIOFOCUS_LOSS to our listener which then calls tts.stop() — producing silence.
+            // AUDIOFOCUS_GAIN_TRANSIENT avoids this conflict.
             val focusRequest = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
                 .setAudioAttributes(
                     AudioAttributes.Builder()
@@ -622,7 +634,11 @@ class TtsPlugin(private val activity: Activity) : Plugin(activity), TextToSpeech
                 
                 // Use modern Bundle API (API 21+) — the deprecated HashMap API does not reliably
                 // trigger UtteranceProgressListener callbacks on some voices/engines.
-                val speakResult = engine.speak(args.text, queueMode, null, utteranceId)
+                // Pass volume in the Bundle (rate/pitch are set directly on the engine).
+                val params = if (volume != 1.0f) {
+                    Bundle().apply { putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, volume) }
+                } else null
+                val speakResult = engine.speak(args.text, queueMode, params, utteranceId)
                 Log.d(TAG, "  speak() result: $speakResult (SUCCESS=${TextToSpeech.SUCCESS}, ERROR=${TextToSpeech.ERROR})")
                 
                 // Log final engine state after speak attempt
@@ -670,10 +686,19 @@ class TtsPlugin(private val activity: Activity) : Plugin(activity), TextToSpeech
                 // UtteranceProgressListener doesn't fire (known issue with Google TTS on emulators).
                 // Uses the same startEmitted/finishEmitted flags as the listener, so exactly
                 // one path wins each event even if both fire around the same time.
+                //
+                // On Android 14+ (API 34+), isSpeaking() returns false as soon as synthesis is
+                // handed to the hardware audio buffer — BEFORE playback actually completes. A naive
+                // !speaking check would then fire speech:finish prematurely for long texts, causing
+                // the caller to stop or replace audio that is still playing.
+                // Fix: debounce finish detection by requiring FINISH_DEBOUNCE_POLLS consecutive
+                // not-speaking readings before concluding that speech is truly over.
                 val pollStartTime = System.currentTimeMillis()
+                val FINISH_DEBOUNCE_POLLS = 15  // 15 × 100ms = 1.5 s of confirmed silence
 
                 activity.runOnUiThread {
                     val handler = android.os.Handler(android.os.Looper.getMainLooper())
+                    var notSpeakingStreak = 0
                     val poll = object : Runnable {
                         override fun run() {
                             if (utteranceId != lastUtteranceId) return  // superseded by newer speak()
@@ -690,14 +715,21 @@ class TtsPlugin(private val activity: Activity) : Plugin(activity), TextToSpeech
                                 trigger("speech:start", e)
                             }
 
-                            if (startEmitted && !finishEmitted && !speaking) {
-                                finishEmitted = true
-                                Log.d(TAG, "Polling: speech:finish for $utteranceId (+${elapsed}ms)")
-                                val e = JSObject()
-                                e.put("id", utteranceId)
-                                trigger("speech:finish", e)
-                                releaseAudioFocus()
-                                return
+                            if (startEmitted && !finishEmitted) {
+                                if (!speaking) {
+                                    notSpeakingStreak++
+                                    if (notSpeakingStreak >= FINISH_DEBOUNCE_POLLS) {
+                                        finishEmitted = true
+                                        Log.d(TAG, "Polling: speech:finish for $utteranceId (+${elapsed}ms, ${notSpeakingStreak} quiet polls)")
+                                        val e = JSObject()
+                                        e.put("id", utteranceId)
+                                        trigger("speech:finish", e)
+                                        releaseAudioFocus()
+                                        return
+                                    }
+                                } else {
+                                    notSpeakingStreak = 0  // transient false — reset streak
+                                }
                             }
 
                             if (!startEmitted && elapsed > 10_000L) {
@@ -1067,6 +1099,16 @@ class TtsPlugin(private val activity: Activity) : Plugin(activity), TextToSpeech
         }
     }
 
+    @Command
+    fun setBackgroundBehavior(invoke: Invoke) {
+        val args = invoke.parseArgs(SetBackgroundBehaviorArgs::class.java)
+        continueInBackground = args.continueInBackground
+        Log.d(TAG, "setBackgroundBehavior() continueInBackground=$continueInBackground")
+        val ret = JSObject()
+        ret.put("success", true)
+        invoke.resolve(ret)
+    }
+
     private fun parseLocale(languageTag: String): Locale {
         Log.d(TAG, "parseLocale($languageTag)")
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
@@ -1093,13 +1135,24 @@ class TtsPlugin(private val activity: Activity) : Plugin(activity), TextToSpeech
     
     override fun onPause() {
         super.onPause()
-        Log.d(TAG, "onPause() CALLED")
+        Log.d(TAG, "onPause() CALLED (continueInBackground=$continueInBackground)")
         isForeground = false
-        // Optionally stop speech when going to background
         if (tts?.isSpeaking == true) {
-            Log.d(TAG, "  Stopping speech due to activity pause")
-            tts?.stop()
-            releaseAudioFocus()
+            if (continueInBackground) {
+                // Continue speaking — TTS engine runs as a system service in background.
+                // Notify JS so it can update UI state if needed.
+                Log.d(TAG, "  App going to background while speaking — continuing in background")
+                val event = JSObject()
+                event.put("reason", "app_paused")
+                trigger("speech:backgroundPause", event)
+            } else {
+                // User opted out of background audio — pause and notify JS.
+                Log.d(TAG, "  App going to background while speaking — pausing (continueInBackground=false)")
+                pauseSpeakingInternal()
+                val event = JSObject()
+                event.put("reason", "app_paused")
+                trigger("speech:backgroundPause", event)
+            }
         }
     }
     

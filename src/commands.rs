@@ -60,3 +60,12 @@ pub(crate) async fn preview_voice<R: Runtime>(
 ) -> Result<SpeakResponse> {
     app.tts().preview_voice(payload)
 }
+
+/// Set whether TTS should continue in background when screen locks (mobile only)
+#[command]
+pub(crate) async fn set_background_behavior<R: Runtime>(
+    app: AppHandle<R>,
+    payload: SetBackgroundBehaviorRequest,
+) -> Result<SetBackgroundBehaviorResponse> {
+    app.tts().set_background_behavior(payload)
+}

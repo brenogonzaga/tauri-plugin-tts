@@ -173,6 +173,21 @@ pub struct StopResponse {
     pub success: bool,
 }
 
+#[derive(Debug, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetBackgroundBehaviorRequest {
+    /// Whether TTS should continue speaking when the app goes to background / screen locks.
+    /// Defaults to true. When false, speech is paused on background and a `speech:backgroundPause`
+    /// event is emitted (matching the previous behavior). Desktop: ignored (no-op).
+    pub continue_in_background: bool,
+}
+
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SetBackgroundBehaviorResponse {
+    pub success: bool,
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize, TS)]
 #[ts(export, export_to = "../guest-js/bindings/")]
 #[serde(rename_all = "camelCase")]
@@ -385,7 +400,7 @@ mod tests {
             Some("com.apple.voice.enhanced.en-US".to_string())
         );
     }
-    
+
     #[test]
     fn test_validation_voice_id_too_long() {
         let long_voice_id = "x".repeat(MAX_VOICE_ID_LENGTH + 1);
