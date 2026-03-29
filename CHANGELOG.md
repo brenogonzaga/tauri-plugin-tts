@@ -5,6 +5,17 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.5] - 2026-03-30
+
+### Fixed
+
+- **Android/iOS** (issue #6): `onSpeechEvent()` now correctly receives speech events on mobile.
+  The previous implementation used Tauri's global event system (`listen()`), which only works
+  for desktop events emitted via Rust `app.emit()`. Android's `trigger()` uses the plugin
+  Channel system, which requires `addPluginListener()`. Both are now called in parallel:
+  `addPluginListener` handles mobile events; `listen` handles desktop events. No duplicate
+  events occur since Android never calls `app.emit()` and desktop never calls `trigger()`.
+
 ## [0.1.4] - 2026-03-29
 
 ### Fixed

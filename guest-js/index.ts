@@ -1,9 +1,9 @@
-import { invoke } from "@tauri-apps/api/core";
+import { invoke, addPluginListener } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { Voice } from "./bindings/Voice";
 import type { PauseResumeResponse } from "./bindings/PauseResumeResponse";
 import type { SpeakOptions } from "./bindings/SpeakOptions";
-import type {PreviewVoiceOptions} from "./bindings/PreviewVoiceOptions";
+import type { PreviewVoiceOptions } from "./bindings/PreviewVoiceOptions";
 
 export type { QueueMode } from "./bindings/QueueMode";
 export type { Voice } from "./bindings/Voice";
@@ -34,12 +34,7 @@ export interface TtsError {
 }
 
 export function isTtsError(error: unknown): error is TtsError {
-  return (
-    typeof error === "object" &&
-    error !== null &&
-    "code" in error &&
-    "message" in error
-  );
+  return typeof error === "object" && error !== null && "code" in error && "message" in error;
 }
 
 export interface SpeechEvent {
@@ -84,11 +79,23 @@ export type SpeechEventType =
  */
 export async function onSpeechEvent(
   eventType: SpeechEventType,
-  callback: (event: SpeechEvent) => void
+  callback: (event: SpeechEvent) => void,
 ): Promise<UnlistenFn> {
-  return listen<SpeechEvent>(`tts://${eventType}`, (event) => {
-    callback(event.payload);
-  });
+  // Desktop: events emitted via Rust app.emit("tts://...")
+  const desktopUnlisten = listen<SpeechEvent>(`tts://${eventType}`, (e) => callback(e.payload));
+
+  // Mobile (Android/iOS): events sent via plugin trigger()
+  // addPluginListener registers through the plugin Channel system
+  const mobileUnlisten = addPluginListener<SpeechEvent>("tts", eventType, callback)
+    .then((listener) => (() => listener.unregister()) as UnlistenFn)
+    .catch(() => (() => Promise.resolve()) as UnlistenFn);
+
+  const [desktop, mobile] = await Promise.all([desktopUnlisten, mobileUnlisten]);
+
+  return () => {
+    desktop();
+    mobile();
+  };
 }
 
 /**
@@ -189,9 +196,7 @@ export async function getVoices(language?: string): Promise<Voice[]> {
  * ```
  */
 export async function isSpeaking(): Promise<boolean> {
-  const response = await invoke<{ speaking: boolean }>(
-    "plugin:tts|is_speaking"
-  );
+  const response = await invoke<{ speaking: boolean }>("plugin:tts|is_speaking");
   return response.speaking;
 }
 
@@ -228,9 +233,7 @@ export async function isInitialized(): Promise<{
   initialized: boolean;
   voiceCount: number;
 }> {
-  return invoke<{ initialized: boolean; voiceCount: number }>(
-    "plugin:tts|is_initialized"
-  );
+  return invoke<{ initialized: boolean; voiceCount: number }>("plugin:tts|is_initialized");
 }
 
 /**
@@ -290,9 +293,7 @@ export async function resumeSpeaking(): Promise<PauseResumeResponse> {
  * });
  * ```
  */
-export async function previewVoice(
-  options: PreviewVoiceOptions
-): Promise<void> {
+export async function previewVoice(options: PreviewVoiceOptions): Promise<void> {
   await invoke("plugin:tts|preview_voice", {
     payload: {
       voiceId: options.voiceId,
