@@ -23,12 +23,10 @@ categories = ["multimedia::audio", "api-bindings"]
 [dependencies]
 tauri = { version = "2.10.3" }
 serde = "1.0"
+serde_json = "1.0"
 thiserror = "2"
 log = "0.4"
 ts-rs = "12.0"
-
-[dev-dependencies]
-serde_json = "1.0"
 
 # Desktop TTS support
 [target.'cfg(not(any(target_os = "android", target_os = "ios")))'.dependencies]

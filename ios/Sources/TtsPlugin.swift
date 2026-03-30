@@ -134,12 +134,17 @@ class SetBackgroundBehaviorArgs: Decodable {
     let continueInBackground: Bool
 }
 
+class SetupEventRelayArgs: Decodable {
+    let channel: Channel
+}
+
 class TtsPlugin: Plugin, AVSpeechSynthesizerDelegate {
     private let synthesizer = AVSpeechSynthesizer()
     private var currentUtteranceId: String?
     private var wasInterrupted: Bool = false
     private var isInForeground: Bool = true
     private var continueInBackground: Bool = true
+    private var eventChannel: Channel? = nil
     private var voiceCache: [AVSpeechSynthesisVoice]?
     private var voiceCacheTimestamp: Date?
     private let voiceCacheTTL: TimeInterval = 60.0
@@ -202,12 +207,12 @@ class TtsPlugin: Plugin, AVSpeechSynthesizerDelegate {
                 // Continue speaking — AVAudioSession .playback category supports background audio.
                 // Notify JS so it can update UI state if needed.
                 NSLog("[TtsPlugin]   App going to background while speaking — continuing in background")
-                trigger("speech:backgroundPause", data: JSObject())
+                emitEvent("speech:backgroundPause")
             } else {
                 // User opted out of background audio — pause and notify JS.
                 NSLog("[TtsPlugin]   App going to background while speaking — pausing (continueInBackground=false)")
                 synthesizer.pauseSpeaking(at: .word)
-                trigger("speech:backgroundPause", data: JSObject())
+                emitEvent("speech:backgroundPause")
             }
         }
     }
@@ -257,7 +262,7 @@ class TtsPlugin: Plugin, AVSpeechSynthesizerDelegate {
             if synthesizer.isSpeaking {
                 synthesizer.pauseSpeaking(at: .word)
                 NSLog("[TtsPlugin] Speech paused due to audio route change (device unavailable)")
-                trigger("speech:pause", data: JSObject())
+                emitEvent("speech:pause")
             }
         case .newDeviceAvailable:
             NSLog("[TtsPlugin] New audio device available")
@@ -281,7 +286,7 @@ class TtsPlugin: Plugin, AVSpeechSynthesizerDelegate {
                 synthesizer.pauseSpeaking(at: .word)
                 NSLog("[TtsPlugin] Speech paused due to interruption")
                 
-                trigger("speech:interrupted", data: JSObject())
+                emitEvent("speech:interrupted")
             }
             
         case .ended:
@@ -311,20 +316,12 @@ class TtsPlugin: Plugin, AVSpeechSynthesizerDelegate {
     }
     
     func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didStart utterance: AVSpeechUtterance) {
-        var event = JSObject()
-        if let id = currentUtteranceId {
-            event["id"] = id
-        }
-        trigger("speech:start", data: event)
+        emitEvent("speech:start", id: currentUtteranceId)
         NSLog("[TtsPlugin] Speech started")
     }
     
     func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
-        var event = JSObject()
-        if let id = currentUtteranceId {
-            event["id"] = id
-        }
-        trigger("speech:finish", data: event)
+        emitEvent("speech:finish", id: currentUtteranceId)
         currentUtteranceId = nil
         NSLog("[TtsPlugin] Speech finished")
         
@@ -333,21 +330,17 @@ class TtsPlugin: Plugin, AVSpeechSynthesizerDelegate {
     }
     
     func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) {
-        var event = JSObject()
-        if let id = currentUtteranceId {
-            event["id"] = id
-        }
-        trigger("speech:cancel", data: event)
+        emitEvent("speech:cancel", id: currentUtteranceId)
         currentUtteranceId = nil
         NSLog("[TtsPlugin] Speech cancelled")
     }
     
     func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didPause utterance: AVSpeechUtterance) {
-        trigger("speech:pause", data: JSObject())
+        emitEvent("speech:pause")
     }
     
     func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didContinue utterance: AVSpeechUtterance) {
-        trigger("speech:resume", data: JSObject())
+        emitEvent("speech:resume")
     }
     
     @objc public func speak(_ invoke: Invoke) throws {
@@ -584,6 +577,43 @@ class TtsPlugin: Plugin, AVSpeechSynthesizerDelegate {
         continueInBackground = args.continueInBackground
         NSLog("[TtsPlugin] setBackgroundBehavior() continueInBackground=\(continueInBackground)")
         invoke.resolve(["success": true])
+    }
+
+    @objc public func setupEventRelay(_ invoke: Invoke) throws {
+        let args = try invoke.parseArgs(SetupEventRelayArgs.self)
+        eventChannel = args.channel
+        NSLog("[TtsPlugin] setupEventRelay() channel registered")
+        invoke.resolve()
+    }
+
+    /// Payload forwarded to Rust via Channel so it can call app.emit().
+    /// Must be Encodable to use Channel.send<T: Encodable>.
+    private struct EventRelayPayload: Encodable {
+        let eventType: String
+        let id: String?
+        let error: String?
+        let interrupted: Bool?
+        let reason: String?
+    }
+
+    /// Emit a TTS event via the relay channel.
+    /// Rust receives it and re-emits via app.emit("tts://<eventType>") so that
+    /// JS listen("tts://speech:finish") works uniformly on every platform.
+    private func emitEvent(
+        _ eventType: String,
+        id: String? = nil,
+        error: String? = nil,
+        interrupted: Bool? = nil,
+        reason: String? = nil
+    ) {
+        let payload = EventRelayPayload(
+            eventType: eventType,
+            id: id,
+            error: error,
+            interrupted: interrupted,
+            reason: reason
+        )
+        try? eventChannel?.send(payload)
     }
 }
 

@@ -1,4 +1,4 @@
-import { invoke, addPluginListener } from "@tauri-apps/api/core";
+import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type { Voice } from "./bindings/Voice";
 import type { PauseResumeResponse } from "./bindings/PauseResumeResponse";
@@ -46,6 +46,8 @@ export interface SpeechEvent {
   error?: string;
   /** Whether speech was interrupted */
   interrupted?: boolean;
+  /** Reason for the event (e.g. "audio_focus_lost", "app_paused") */
+  reason?: string;
 }
 
 export type SpeechEventType =
@@ -82,20 +84,9 @@ export async function onSpeechEvent(
   callback: (event: SpeechEvent) => void,
 ): Promise<UnlistenFn> {
   // Desktop: events emitted via Rust app.emit("tts://...")
-  const desktopUnlisten = listen<SpeechEvent>(`tts://${eventType}`, (e) => callback(e.payload));
-
-  // Mobile (Android/iOS): events sent via plugin trigger()
-  // addPluginListener registers through the plugin Channel system
-  const mobileUnlisten = addPluginListener<SpeechEvent>("tts", eventType, callback)
-    .then((listener) => (() => listener.unregister()) as UnlistenFn)
-    .catch(() => (() => Promise.resolve()) as UnlistenFn);
-
-  const [desktop, mobile] = await Promise.all([desktopUnlisten, mobileUnlisten]);
-
-  return () => {
-    desktop();
-    mobile();
-  };
+  // Mobile: events sent from native via a Tauri Channel to the Rust relay,
+  //         which re-emits via app.emit() — same path as desktop.
+  return listen<SpeechEvent>(`tts://${eventType}`, (e) => callback(e.payload));
 }
 
 /**

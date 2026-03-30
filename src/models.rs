@@ -100,6 +100,8 @@ pub enum ValidationError {
     TextTooLong { len: usize, max: usize },
     #[error("Voice ID too long: {len} chars (max: {max})")]
     VoiceIdTooLong { len: usize, max: usize },
+    #[error("Invalid voice ID format - only alphanumeric, dots, underscores, and hyphens allowed")]
+    InvalidVoiceId,
     #[error("Language code too long: {len} chars (max: {max})")]
     LanguageTooLong { len: usize, max: usize },
 }
@@ -135,6 +137,11 @@ impl SpeakRequest {
             .map(|lang| Self::validate_language(lang))
             .transpose()?;
 
+        // Voice ID validation (if provided)
+        if let Some(ref voice_id) = self.voice_id {
+            Self::validate_voice_id(voice_id)?;
+        }
+
         Ok(ValidatedSpeakRequest {
             text: self.text.clone(),
             language: sanitized_language,
@@ -154,6 +161,23 @@ impl SpeakRequest {
             });
         }
         Ok(lang.to_string())
+    }
+
+    fn validate_voice_id(voice_id: &str) -> Result<(), ValidationError> {
+        if voice_id.len() > MAX_VOICE_ID_LENGTH {
+            return Err(ValidationError::VoiceIdTooLong {
+                len: voice_id.len(),
+                max: MAX_VOICE_ID_LENGTH,
+            });
+        }
+        // Only allow alphanumeric, dots, underscores, and hyphens (matches iOS validation)
+        if !voice_id
+            .chars()
+            .all(|c| c.is_alphanumeric() || c == '.' || c == '_' || c == '-')
+        {
+            return Err(ValidationError::InvalidVoiceId);
+        }
+        Ok(())
     }
 }
 
@@ -276,6 +300,31 @@ impl PreviewVoiceRequest {
 
         Ok(())
     }
+}
+
+/// On desktop, emitted directly via `app.emit("tts://<event_type>", payload)`.
+/// On mobile, native plugins send this through a Tauri `Channel`; the Rust relay
+/// deserializes it and re-emits via `app.emit()` so JS `listen("tts://...")` works
+/// uniformly on every platform.
+///
+/// The shape matches the JS `SpeechEvent` interface.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TtsEventPayload {
+    /// The event name, e.g. "speech:finish". Used to build the emit key "tts://<event_type>".
+    pub event_type: String,
+    /// Unique identifier for the utterance (if available)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// Error message (for error events)
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// Whether speech was interrupted
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub interrupted: Option<bool>,
+    /// Reason for the event (e.g. "audio_focus_lost", "app_paused")
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
 }
 
 #[cfg(test)]

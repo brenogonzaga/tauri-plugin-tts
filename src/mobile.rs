@@ -1,7 +1,9 @@
 use serde::de::DeserializeOwned;
+use serde::Serialize;
 use tauri::{
+    ipc::Channel,
     plugin::{PluginApi, PluginHandle},
-    AppHandle, Runtime,
+    AppHandle, Emitter, Runtime,
 };
 
 use crate::models::*;
@@ -23,6 +25,48 @@ pub fn init<R: Runtime, C: DeserializeOwned>(
 pub struct Tts<R: Runtime>(PluginHandle<R>);
 
 impl<R: Runtime> Tts<R> {
+    /// Set up a persistent event relay: native code calls `channel.send(TtsEventPayload)`,
+    /// Rust receives it and re-emits via `app.emit("tts://<event_type>", payload)` so that
+    /// JS `listen("tts://speech:finish", ...)` works on mobile exactly like desktop.
+    pub fn setup_event_relay(&self, app: &AppHandle<R>) -> crate::Result<()> {
+        use tauri::ipc::InvokeResponseBody;
+
+        let app_handle = app.clone();
+        let channel = Channel::<TtsEventPayload>::new(move |body| {
+            let payload: TtsEventPayload = match body {
+                InvokeResponseBody::Json(json) => match serde_json::from_str(&json) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        log::warn!("Failed to parse TTS relay event JSON: {e}");
+                        return Ok(());
+                    }
+                },
+                InvokeResponseBody::Raw(bytes) => match serde_json::from_slice(&bytes) {
+                    Ok(p) => p,
+                    Err(e) => {
+                        log::warn!("Failed to parse TTS relay event bytes: {e}");
+                        return Ok(());
+                    }
+                },
+            };
+            if !payload.event_type.is_empty() {
+                let event_name = format!("tts://{}", payload.event_type);
+                let _ = app_handle.emit(&event_name, &payload);
+            }
+            Ok(())
+        });
+
+        #[derive(Serialize)]
+        struct RelayArgs {
+            channel: Channel<TtsEventPayload>,
+        }
+
+        self.0
+            .run_mobile_plugin::<serde_json::Value>("setupEventRelay", RelayArgs { channel })
+            .map(|_| ())
+            .map_err(Into::into)
+    }
+
     pub fn speak(&self, payload: SpeakRequest) -> crate::Result<SpeakResponse> {
         self.0
             .run_mobile_plugin("speak", payload)

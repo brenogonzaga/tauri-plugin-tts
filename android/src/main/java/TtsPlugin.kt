@@ -13,6 +13,7 @@ import android.util.Log
 import app.tauri.annotation.Command
 import app.tauri.annotation.InvokeArg
 import app.tauri.annotation.TauriPlugin
+import app.tauri.plugin.Channel
 import app.tauri.plugin.JSArray
 import app.tauri.plugin.JSObject
 import app.tauri.plugin.Plugin
@@ -47,6 +48,11 @@ class PreviewVoiceArgs {
 @InvokeArg
 class SetBackgroundBehaviorArgs {
     var continueInBackground: Boolean = true
+}
+
+@InvokeArg
+class SetupEventRelayArgs {
+    lateinit var channel: Channel
 }
 
 /** Maximum text length allowed (10KB) */
@@ -100,6 +106,8 @@ class TtsPlugin(private val activity: Activity) : Plugin(activity), TextToSpeech
     private var isForeground = true
     private var continueInBackground = true
     private var isPaused = false
+    // Relay channel: forwards events to Rust app.emit() so JS listen() works on mobile.
+    private var eventChannel: Channel? = null
     private val pendingRequests = ConcurrentLinkedQueue<PendingSpeak>()
     private var audioManager: AudioManager? = null
     private var audioFocusRequest: AudioFocusRequest? = null
@@ -121,9 +129,7 @@ class TtsPlugin(private val activity: Activity) : Plugin(activity), TextToSpeech
                 Log.d(TAG, "Audio focus LOST permanently")
                 wasPlayingBeforeInterruption = tts?.isSpeaking == true
                 tts?.stop()
-                val event = JSObject()
-                event.put("reason", "audio_focus_lost")
-                trigger("speech:interrupted", event)
+                emitEvent("speech:interrupted", reason = "audio_focus_lost")
             }
             AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> {
                 // Temporary loss - e.g., phone call
@@ -131,9 +137,7 @@ class TtsPlugin(private val activity: Activity) : Plugin(activity), TextToSpeech
                 wasPlayingBeforeInterruption = tts?.isSpeaking == true
                 if (wasPlayingBeforeInterruption) {
                     pauseSpeakingInternal()
-                    val event = JSObject()
-                    event.put("reason", "audio_focus_transient_loss")
-                    trigger("speech:paused", event)
+                    emitEvent("speech:pause", reason = "audio_focus_transient_loss")
                 }
             }
             AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
@@ -142,9 +146,7 @@ class TtsPlugin(private val activity: Activity) : Plugin(activity), TextToSpeech
                 wasPlayingBeforeInterruption = tts?.isSpeaking == true
                 if (wasPlayingBeforeInterruption) {
                     pauseSpeakingInternal()
-                    val event = JSObject()
-                    event.put("reason", "audio_focus_duck")
-                    trigger("speech:paused", event)
+                    emitEvent("speech:pause", reason = "audio_focus_duck")
                 }
             }
             AudioManager.AUDIOFOCUS_GAIN -> {
@@ -152,9 +154,7 @@ class TtsPlugin(private val activity: Activity) : Plugin(activity), TextToSpeech
                 Log.d(TAG, "Audio focus GAINED")
                 if (wasPlayingBeforeInterruption && isPaused) {
                     resumeSpeakingInternal()
-                    val event = JSObject()
-                    event.put("reason", "audio_focus_regained")
-                    trigger("speech:resumed", event)
+                    emitEvent("speech:resume", reason = "audio_focus_regained")
                 }
                 wasPlayingBeforeInterruption = false
             }
@@ -227,9 +227,7 @@ class TtsPlugin(private val activity: Activity) : Plugin(activity), TextToSpeech
                 Log.d(TAG, "✓ UtteranceProgressListener.onStart() CALLED: $utteranceId")
                 if (!startEmitted) {
                     startEmitted = true
-                    val event = JSObject()
-                    event.put("id", utteranceId ?: "")
-                    trigger("speech:start", event)
+                    emitEvent("speech:start", id = utteranceId ?: "")
                 }
             }
             
@@ -237,9 +235,7 @@ class TtsPlugin(private val activity: Activity) : Plugin(activity), TextToSpeech
                 Log.d(TAG, "✓ UtteranceProgressListener.onDone() CALLED: $utteranceId")
                 if (!finishEmitted) {
                     finishEmitted = true
-                    val event = JSObject()
-                    event.put("id", utteranceId ?: "")
-                    trigger("speech:finish", event)
+                    emitEvent("speech:finish", id = utteranceId ?: "")
                     releaseAudioFocus()
                 }
             }
@@ -249,10 +245,7 @@ class TtsPlugin(private val activity: Activity) : Plugin(activity), TextToSpeech
                 Log.e(TAG, "✗ UtteranceProgressListener.onError() CALLED: $utteranceId")
                 if (!finishEmitted) {
                     finishEmitted = true
-                    val event = JSObject()
-                    event.put("id", utteranceId ?: "")
-                    event.put("error", "Speech synthesis error")
-                    trigger("speech:error", event)
+                    emitEvent("speech:error", id = utteranceId ?: "", error = "Speech synthesis error")
                     releaseAudioFocus()
                 }
             }
@@ -261,11 +254,7 @@ class TtsPlugin(private val activity: Activity) : Plugin(activity), TextToSpeech
                 Log.e(TAG, "✗ UtteranceProgressListener.onError() CALLED: $utteranceId, code: $errorCode")
                 if (!finishEmitted) {
                     finishEmitted = true
-                    val event = JSObject()
-                    event.put("id", utteranceId ?: "")
-                    event.put("error", getErrorMessage(errorCode))
-                    event.put("code", errorCode)
-                    trigger("speech:error", event)
+                    emitEvent("speech:error", id = utteranceId ?: "", error = getErrorMessage(errorCode))
                     releaseAudioFocus()
                 }
             }
@@ -274,10 +263,7 @@ class TtsPlugin(private val activity: Activity) : Plugin(activity), TextToSpeech
                 Log.d(TAG, "✓ UtteranceProgressListener.onStop() CALLED: $utteranceId, interrupted: $interrupted")
                 if (!finishEmitted) {
                     finishEmitted = true
-                    val event = JSObject()
-                    event.put("id", utteranceId ?: "")
-                    event.put("interrupted", interrupted)
-                    trigger("speech:cancel", event)
+                    emitEvent("speech:cancel", id = utteranceId ?: "", interrupted = interrupted)
                     releaseAudioFocus()
                 }
             }
@@ -710,9 +696,7 @@ class TtsPlugin(private val activity: Activity) : Plugin(activity), TextToSpeech
                             if (!startEmitted && speaking) {
                                 startEmitted = true
                                 Log.d(TAG, "Polling: speech:start for $utteranceId (+${elapsed}ms)")
-                                val e = JSObject()
-                                e.put("id", utteranceId)
-                                trigger("speech:start", e)
+                                emitEvent("speech:start", id = utteranceId)
                             }
 
                             if (startEmitted && !finishEmitted) {
@@ -721,9 +705,7 @@ class TtsPlugin(private val activity: Activity) : Plugin(activity), TextToSpeech
                                     if (notSpeakingStreak >= FINISH_DEBOUNCE_POLLS) {
                                         finishEmitted = true
                                         Log.d(TAG, "Polling: speech:finish for $utteranceId (+${elapsed}ms, ${notSpeakingStreak} quiet polls)")
-                                        val e = JSObject()
-                                        e.put("id", utteranceId)
-                                        trigger("speech:finish", e)
+                                        emitEvent("speech:finish", id = utteranceId)
                                         releaseAudioFocus()
                                         return
                                     }
@@ -736,10 +718,7 @@ class TtsPlugin(private val activity: Activity) : Plugin(activity), TextToSpeech
                                 if (!finishEmitted) {
                                     finishEmitted = true
                                     Log.e(TAG, "⚠️ Polling timeout: speech never started for $utteranceId")
-                                    val e = JSObject()
-                                    e.put("id", utteranceId)
-                                    e.put("error", "TTS engine did not start speaking after 10 seconds")
-                                    trigger("speech:error", e)
+                                    emitEvent("speech:error", id = utteranceId, error = "TTS engine did not start speaking after 10 seconds")
                                     releaseAudioFocus()
                                 }
                                 return
@@ -959,8 +938,7 @@ class TtsPlugin(private val activity: Activity) : Plugin(activity), TextToSpeech
                 Log.d(TAG, "Speech paused successfully")
                 
                 // Emit pause event
-                val event = JSObject()
-                trigger("speech:pause", event)
+                emitEvent("speech:pause")
                 
                 val ret = JSObject()
                 ret.put("success", true)
@@ -1012,8 +990,7 @@ class TtsPlugin(private val activity: Activity) : Plugin(activity), TextToSpeech
             Log.d(TAG, "Speech resumed successfully")
             
             // Emit resume event
-            val event = JSObject()
-            trigger("speech:resume", event)
+            emitEvent("speech:resume")
             
             val ret = JSObject()
             ret.put("success", true)
@@ -1109,6 +1086,35 @@ class TtsPlugin(private val activity: Activity) : Plugin(activity), TextToSpeech
         invoke.resolve(ret)
     }
 
+    @Command
+    fun setupEventRelay(invoke: Invoke) {
+        val args = invoke.parseArgs(SetupEventRelayArgs::class.java)
+        eventChannel = args.channel
+        Log.d(TAG, "setupEventRelay() channel registered")
+        invoke.resolve()
+    }
+
+    /**
+     * Emit a TTS event via the Rust relay channel.
+     * Rust receives it and re-emits via app.emit("tts://<eventType>") so that
+     * JS listen("tts://speech:finish") works uniformly on every platform.
+     */
+    private fun emitEvent(
+        eventType: String,
+        id: String? = null,
+        error: String? = null,
+        interrupted: Boolean? = null,
+        reason: String? = null
+    ) {
+        val data = JSObject()
+        data.put("eventType", eventType)
+        id?.let { data.put("id", it) }
+        error?.let { data.put("error", it) }
+        interrupted?.let { data.put("interrupted", it) }
+        reason?.let { data.put("reason", it) }
+        eventChannel?.send(data)
+    }
+
     private fun parseLocale(languageTag: String): Locale {
         Log.d(TAG, "parseLocale($languageTag)")
         return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
@@ -1142,16 +1148,12 @@ class TtsPlugin(private val activity: Activity) : Plugin(activity), TextToSpeech
                 // Continue speaking — TTS engine runs as a system service in background.
                 // Notify JS so it can update UI state if needed.
                 Log.d(TAG, "  App going to background while speaking — continuing in background")
-                val event = JSObject()
-                event.put("reason", "app_paused")
-                trigger("speech:backgroundPause", event)
+                emitEvent("speech:backgroundPause", reason = "app_paused")
             } else {
                 // User opted out of background audio — pause and notify JS.
                 Log.d(TAG, "  App going to background while speaking — pausing (continueInBackground=false)")
                 pauseSpeakingInternal()
-                val event = JSObject()
-                event.put("reason", "app_paused")
-                trigger("speech:backgroundPause", event)
+                emitEvent("speech:backgroundPause", reason = "app_paused")
             }
         }
     }

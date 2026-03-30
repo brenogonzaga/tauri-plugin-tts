@@ -1,23 +1,10 @@
 use serde::de::DeserializeOwned;
-use serde::Serialize;
 use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 use tauri::{plugin::PluginApi, AppHandle, Emitter, Runtime};
 use tts::{Features, Tts as TtsEngine};
 
 use crate::models::*;
-
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-#[derive(Default)]
-pub struct SpeechEvent {
-    /// Unique identifier for the utterance (if available)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub id: Option<String>,
-    /// Event type description
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub event_type: Option<String>,
-}
 
 struct VoiceCache {
     voices: Vec<Voice>,
@@ -44,7 +31,7 @@ struct EventEmitter<R: Runtime> {
 }
 
 impl<R: Runtime> EventEmitter<R> {
-    fn emit(&self, event_name: &str, event: SpeechEvent) {
+    fn emit(&self, event_name: &str, event: TtsEventPayload) {
         let full_event_name = format!("tts://{}", event_name);
         if let Err(e) = self.app.emit(&full_event_name, event) {
             log::warn!("Failed to emit TTS event '{}': {}", event_name, e);
@@ -117,9 +104,9 @@ pub fn init<R: Runtime, C: DeserializeOwned>(
         if let Err(e) = engine.on_utterance_end(Some(Box::new(move |_utterance_id| {
             end_emitter.emit(
                 "speech:finish",
-                SpeechEvent {
-                    id: None,
-                    event_type: Some("finish".to_string()),
+                TtsEventPayload {
+                    event_type: "speech:finish".to_string(),
+                    ..Default::default()
                 },
             );
         }))) {
@@ -130,9 +117,9 @@ pub fn init<R: Runtime, C: DeserializeOwned>(
         if let Err(e) = engine.on_utterance_stop(Some(Box::new(move |_utterance_id| {
             stop_emitter.emit(
                 "speech:cancel",
-                SpeechEvent {
-                    id: None,
-                    event_type: Some("cancel".to_string()),
+                TtsEventPayload {
+                    event_type: "speech:cancel".to_string(),
+                    ..Default::default()
                 },
             );
         }))) {
@@ -148,6 +135,7 @@ pub fn init<R: Runtime, C: DeserializeOwned>(
         app: app.clone(),
         engine: Mutex::new(engine),
         voice_cache: RwLock::new(None),
+        has_utterance_callbacks: utterance_callbacks,
     })
 }
 
@@ -155,6 +143,7 @@ pub struct Tts<R: Runtime> {
     app: AppHandle<R>,
     engine: Mutex<TtsEngine>,
     voice_cache: RwLock<Option<VoiceCache>>,
+    has_utterance_callbacks: bool,
 }
 
 impl<R: Runtime> Tts<R> {
@@ -170,7 +159,7 @@ impl<R: Runtime> Tts<R> {
         f(&mut engine)
     }
 
-    fn emit_event(&self, event_name: &str, event: SpeechEvent) {
+    fn emit_event(&self, event_name: &str, event: TtsEventPayload) {
         let full_event_name = format!("tts://{}", event_name);
         if let Err(e) = self.app.emit(&full_event_name, event) {
             log::warn!("Failed to emit TTS event '{}': {}", event_name, e);
@@ -183,15 +172,6 @@ impl<R: Runtime> Tts<R> {
 
         // Generate utterance ID for tracking
         let utterance_id = uuid::Uuid::new_v4().to_string();
-
-        // Emit speech:start event
-        self.emit_event(
-            "speech:start",
-            SpeechEvent {
-                id: Some(utterance_id.clone()),
-                event_type: Some("start".to_string()),
-            },
-        );
 
         let result = self.with_engine(|engine| {
             // Set voice if specified
@@ -241,24 +221,41 @@ impl<R: Runtime> Tts<R> {
                 warning: None,
             })
         });
+
+        // Emit speech:start only after engine.speak() succeeds
+        if result.is_ok() {
+            self.emit_event(
+                "speech:start",
+                TtsEventPayload {
+                    event_type: "speech:start".to_string(),
+                    id: Some(utterance_id),
+                    ..Default::default()
+                },
+            );
+        }
+
         result
     }
 
     pub fn stop(&self) -> crate::Result<StopResponse> {
-        // Note: speech:cancel is emitted via on_utterance_stop callback set up in init()
-        // for platforms that support it. We still emit here as fallback for legacy backends.
-        self.emit_event(
-            "speech:cancel",
-            SpeechEvent {
-                id: None,
-                event_type: Some("cancel".to_string()),
-            },
-        );
-
         self.with_engine(|engine| {
             engine.stop()?;
             Ok(StopResponse { success: true })
-        })
+        })?;
+
+        // Only emit speech:cancel as a fallback for engines without utterance callbacks.
+        // When callbacks are supported, on_utterance_stop fires and emits the event.
+        if !self.has_utterance_callbacks {
+            self.emit_event(
+                "speech:cancel",
+                TtsEventPayload {
+                    event_type: "speech:cancel".to_string(),
+                    ..Default::default()
+                },
+            );
+        }
+
+        Ok(StopResponse { success: true })
     }
 
     pub fn get_voices(&self, payload: GetVoicesRequest) -> crate::Result<GetVoicesResponse> {
