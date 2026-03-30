@@ -12,6 +12,7 @@ Default permissions for the TTS plugin - allows all text-to-speech operations
 - `allow-pause-speaking`
 - `allow-resume-speaking`
 - `allow-preview-voice`
+- `allow-register-listener`
 
 ## Permission Table
 
@@ -148,6 +149,32 @@ Enables the preview_voice command without any pre-configured scope.
 <td>
 
 Denies the preview_voice command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`tts:allow-register-listener`
+
+</td>
+<td>
+
+Enables the register_listener command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`tts:deny-register-listener`
+
+</td>
+<td>
+
+Denies the register_listener command without any pre-configured scope.
 
 </td>
 </tr>

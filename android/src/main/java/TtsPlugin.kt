@@ -807,7 +807,6 @@ class TtsPlugin(private val activity: Activity) : Plugin(activity), TextToSpeech
             val engine = tts // Local reference for filtering
             val installedVoices = if (engine != null) {
                 voices.filter { voice ->
-                    val quality = voice.quality
                     val features = voice.features
 
                     // Network voices: include all — they work with internet connection
@@ -1118,6 +1117,10 @@ class TtsPlugin(private val activity: Activity) : Plugin(activity), TextToSpeech
         interrupted: Boolean? = null,
         reason: String? = null
     ) {
+        if (eventChannel == null) {
+            Log.w(TAG, "emitEvent($eventType) — eventChannel is NULL, register_listener was not called yet")
+            return
+        }
         val data = JSObject()
         data.put("eventType", eventType)
         id?.let { data.put("id", it) }

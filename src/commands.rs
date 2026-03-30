@@ -61,6 +61,20 @@ pub(crate) async fn preview_voice<R: Runtime>(
     app.tts().preview_voice(payload)
 }
 
+/// Register the native event relay channel (mobile only, no-op on desktop).
+/// Must be called once before listening with `onSpeechEvent`.
+#[command]
+pub(crate) async fn register_listener<R: Runtime>(app: AppHandle<R>) -> Result<()> {
+    #[cfg(not(mobile))]
+    let _ = app;
+    #[cfg(mobile)]
+    {
+        let app_clone = app.clone();
+        app.tts().setup_event_relay(&app_clone)?;
+    }
+    Ok(())
+}
+
 /// Set whether TTS should continue in background when screen locks (mobile only)
 #[command]
 pub(crate) async fn set_background_behavior<R: Runtime>(

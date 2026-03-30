@@ -7,6 +7,7 @@ const COMMANDS: &[&str] = &[
     "pause_speaking",
     "resume_speaking",
     "preview_voice",
+    "register_listener",
 ];
 
 fn main() {

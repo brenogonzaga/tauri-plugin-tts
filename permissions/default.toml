@@ -11,4 +11,5 @@ permissions = [
     "allow-pause-speaking",
     "allow-resume-speaking",
     "allow-preview-voice",
+    "allow-register-listener",
 ]

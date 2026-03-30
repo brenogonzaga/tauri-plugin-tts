@@ -1,3 +1,5 @@
+use std::sync::Mutex;
+
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use tauri::{
@@ -19,10 +21,18 @@ pub fn init<R: Runtime, C: DeserializeOwned>(
     let handle = api.register_android_plugin("io.affex.tts", "TtsPlugin")?;
     #[cfg(target_os = "ios")]
     let handle = api.register_ios_plugin(init_plugin_tts)?;
-    Ok(Tts(handle))
+    Ok(Tts {
+        handle,
+        relay_channel: Mutex::new(None),
+    })
 }
 
-pub struct Tts<R: Runtime>(PluginHandle<R>);
+pub struct Tts<R: Runtime> {
+    handle: PluginHandle<R>,
+    /// Keeps the Channel alive so Kotlin can call send() at any point after setup.
+    /// Dropping the Channel would destroy the Rust-side callback, silencing all events.
+    relay_channel: Mutex<Option<Channel<TtsEventPayload>>>,
+}
 
 impl<R: Runtime> Tts<R> {
     /// Set up a persistent event relay: native code calls `channel.send(TtsEventPayload)`,
@@ -57,58 +67,68 @@ impl<R: Runtime> Tts<R> {
         });
 
         #[derive(Serialize)]
-        struct RelayArgs {
-            channel: Channel<TtsEventPayload>,
+        struct RelayArgs<'a> {
+            channel: &'a Channel<TtsEventPayload>,
         }
 
-        self.0
-            .run_mobile_plugin::<serde_json::Value>("setupEventRelay", RelayArgs { channel })
-            .map(|_| ())
-            .map_err(Into::into)
+        self.handle
+            .run_mobile_plugin::<serde_json::Value>(
+                "setupEventRelay",
+                RelayArgs { channel: &channel },
+            )
+            .map_err(crate::Error::from)?;
+
+        // Store AFTER the mobile plugin call succeeds so the Channel is kept alive
+        // for the lifetime of this Tts instance.
+        *self.relay_channel.lock().unwrap() = Some(channel);
+
+        Ok(())
     }
 
     pub fn speak(&self, payload: SpeakRequest) -> crate::Result<SpeakResponse> {
-        self.0
+        self.handle
             .run_mobile_plugin("speak", payload)
             .map_err(Into::into)
     }
 
     pub fn stop(&self) -> crate::Result<StopResponse> {
-        self.0.run_mobile_plugin("stop", ()).map_err(Into::into)
+        self.handle
+            .run_mobile_plugin("stop", ())
+            .map_err(Into::into)
     }
 
     pub fn get_voices(&self, payload: GetVoicesRequest) -> crate::Result<GetVoicesResponse> {
-        self.0
+        self.handle
             .run_mobile_plugin("getVoices", payload)
             .map_err(Into::into)
     }
 
     pub fn is_speaking(&self) -> crate::Result<IsSpeakingResponse> {
-        self.0
+        self.handle
             .run_mobile_plugin("isSpeaking", ())
             .map_err(Into::into)
     }
 
     pub fn is_initialized(&self) -> crate::Result<IsInitializedResponse> {
-        self.0
+        self.handle
             .run_mobile_plugin("isInitialized", ())
             .map_err(Into::into)
     }
 
     pub fn pause_speaking(&self) -> crate::Result<PauseResumeResponse> {
-        self.0
+        self.handle
             .run_mobile_plugin("pauseSpeaking", ())
             .map_err(Into::into)
     }
 
     pub fn resume_speaking(&self) -> crate::Result<PauseResumeResponse> {
-        self.0
+        self.handle
             .run_mobile_plugin("resumeSpeaking", ())
             .map_err(Into::into)
     }
 
     pub fn preview_voice(&self, payload: PreviewVoiceRequest) -> crate::Result<SpeakResponse> {
-        self.0
+        self.handle
             .run_mobile_plugin("previewVoice", payload)
             .map_err(Into::into)
     }
@@ -117,7 +137,7 @@ impl<R: Runtime> Tts<R> {
         &self,
         payload: SetBackgroundBehaviorRequest,
     ) -> crate::Result<SetBackgroundBehaviorResponse> {
-        self.0
+        self.handle
             .run_mobile_plugin("setBackgroundBehavior", payload)
             .map_err(Into::into)
     }

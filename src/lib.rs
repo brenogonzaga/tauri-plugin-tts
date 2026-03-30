@@ -43,17 +43,13 @@ pub fn init<R: Runtime>() -> TauriPlugin<R> {
             commands::pause_speaking,
             commands::resume_speaking,
             commands::preview_voice,
-            commands::set_background_behavior
+            commands::set_background_behavior,
+            commands::register_listener
         ])
         .setup(|app, api| {
             #[cfg(mobile)]
             {
                 let tts = mobile::init(app, api)?;
-                // Set up the relay channel that forwards native events through app.emit()
-                // so JS can use listen("tts://speech:finish") uniformly on all platforms.
-                if let Err(e) = tts.setup_event_relay(app) {
-                    log::warn!("TTS event relay setup failed: {e:?}");
-                }
                 app.manage(tts);
             }
             #[cfg(desktop)]

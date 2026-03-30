@@ -41,7 +41,6 @@ export default function App() {
   const [ttsReady, setTtsReady] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
-  const initCheckRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const speechUnlistenRef = useRef<UnlistenFn | null>(null);
 
   const waitForTtsInit = useCallback(async (): Promise<boolean> => {
@@ -66,11 +65,7 @@ export default function App() {
       setError(null);
 
       // Wait for TTS engine to be ready
-      const ready = await waitForTtsInit();
-      if (!ready) {
-        // Try loading anyway - might work
-        console.warn("TTS init check timed out, attempting to load voices");
-      }
+      await waitForTtsInit();
 
       await loadVoices();
     };
@@ -78,9 +73,6 @@ export default function App() {
     initAndLoad();
 
     return () => {
-      if (initCheckRef.current) {
-        clearInterval(initCheckRef.current);
-      }
       speechUnlistenRef.current?.();
     };
   }, [waitForTtsInit]);

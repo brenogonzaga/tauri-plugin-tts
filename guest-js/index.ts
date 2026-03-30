@@ -60,6 +60,20 @@ export type SpeechEventType =
   | "speech:interrupted"
   | "speech:backgroundPause";
 
+// Singleton promise: ensures register_listener is only invoked once per page load.
+// On mobile this sets up the native → Rust → JS event relay channel.
+// On desktop it is a no-op that resolves immediately.
+let _relayRegistered: Promise<void> | null = null;
+function ensureRelayRegistered(): Promise<void> {
+  if (!_relayRegistered) {
+    _relayRegistered = invoke<void>("plugin:tts|register_listener").catch((e) => {
+      _relayRegistered = null; // allow retry on next call
+      throw e;
+    });
+  }
+  return _relayRegistered;
+}
+
 /**
  * Listen for TTS speech events
  *
@@ -83,9 +97,11 @@ export async function onSpeechEvent(
   eventType: SpeechEventType,
   callback: (event: SpeechEvent) => void,
 ): Promise<UnlistenFn> {
-  // Desktop: events emitted via Rust app.emit("tts://...")
-  // Mobile: events sent from native via a Tauri Channel to the Rust relay,
-  //         which re-emits via app.emit() — same path as desktop.
+  // Ensure the native relay channel is registered before subscribing.
+  // On mobile this calls plugin:tts|register_listener which passes a Channel
+  // to the native plugin so it can forward events via app.emit().
+  // On desktop this is a no-op.
+  await ensureRelayRegistered();
   return listen<SpeechEvent>(`tts://${eventType}`, (e) => callback(e.payload));
 }
 
