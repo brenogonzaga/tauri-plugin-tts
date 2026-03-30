@@ -308,6 +308,24 @@ class TtsPlugin(private val activity: Activity) : Plugin(activity), TextToSpeech
             audioManager?.abandonAudioFocus(audioFocusChangeListener)
         }
     }
+
+    /**
+     * Reinitialize the TTS engine from scratch.
+     */
+    private fun reinitializeTts() {
+        Log.w(TAG, "reinitializeTts() - engine in bad state, restarting")
+        releaseAudioFocus()
+        tts?.stop()
+        tts?.shutdown()
+        tts = null
+        isInitialized = false
+        cachedVoices = null
+        lastVoiceId = null
+        startEmitted = false
+        finishEmitted = false
+        Log.d(TAG, "reinitializeTts() - creating new TextToSpeech instance...")
+        tts = TextToSpeech(activity, this)
+    }
     
     private fun getErrorMessage(errorCode: Int): String {
         return when (errorCode) {
@@ -419,43 +437,29 @@ class TtsPlugin(private val activity: Activity) : Plugin(activity), TextToSpeech
                             }
                         }
                         
-                        if (voices != null && voices.isNotEmpty()) {
-                            Log.i(TAG, "  ✓ Voices refreshed successfully! Now have ${voices.size} voices")
-                        } else {
-                            Log.e(TAG, "  ✗ All refresh strategies failed - engine in bad state")
-                        }
-                    }
-                    
-                    when {
-                        voices == null || voices.isEmpty() -> {
-                            // Engine voices still unavailable after all refresh attempts
-                            Log.e(TAG, "  TTS engine voices unavailable even after aggressive refresh")
-                            Log.e(TAG, "  Current engine.voice: ${engine.voice?.name ?: "null"}")
-                            
-                            if (id == lastVoiceId) {
-                                // Same voice as before - continue even if engine.voice is null
-                                // The engine might still have the voice configured internally
-                                Log.d(TAG, "  Requested voice matches last set voice ($lastVoiceId)")
-                                if (engine.voice == null) {
-                                    Log.w(TAG, "  Engine voice is NULL but will try to speak anyway")
-                                    Log.w(TAG, "  The TTS engine may still have the voice configured internally")
-                                    warning = "Voice temporarily unavailable, attempting to use last configured voice"
-                                } else {
-                                    warning = "Voice list temporarily unavailable, using current voice"
-                                }
+                        // Strategy 4: fall back to the cache populated by getVoices()
+                        if (voices == null || voices.isEmpty()) {
+                            val cached = cachedVoices
+                            if (cached != null && cached.isNotEmpty()) {
+                                Log.i(TAG, "  ✓ Strategy 4 - Using cachedVoices: ${cached.size} voices")
+                                voices = cached
                             } else {
-                                // Different voice requested but cannot change
-                                Log.w(TAG, "  Cannot change voice - engine voices unavailable")
-                                Log.w(TAG, "  Requested: $id, Last set: $lastVoiceId, Current: ${engine.voice?.name}")
-                                invoke.reject("Cannot change voice at this moment - TTS engine voices unavailable. Please try again.")
+                                // Engine truly broken AND no cache — reinitialize and retry.
+                                Log.w(TAG, "  Engine in bad state (voices=null, no cache). Queuing and reinitializing...")
+                                if (pendingRequests.size < MAX_PENDING_REQUESTS) {
+                                    pendingRequests.add(PendingSpeak(invoke, args))
+                                } else {
+                                    invoke.reject("TTS engine is temporarily unavailable. Please try again in a moment.")
+                                }
+                                reinitializeTts()
                                 return
                             }
-                            
-                            // Log cache info
-                            cachedVoices?.let {
-                                Log.d(TAG, "  (Cache has ${it.size} voices for reference)")
-                            }
+                        } else {
+                            Log.i(TAG, "  ✓ Voices refreshed successfully! Now have ${voices.size} voices")
                         }
+                    }
+
+                    when {
                         else -> {
                             // Voices available - can set new voice
                             cachedVoices = voices
@@ -546,7 +550,7 @@ class TtsPlugin(private val activity: Activity) : Plugin(activity), TextToSpeech
                         // If no voice is set, try to set a default one
                         if (currentVoice == null) {
                             Log.w(TAG, "  No voice is currently set, attempting to set default")
-                            val voices = engine.voices
+                            val voices = (engine.voices?.takeIf { it.isNotEmpty() } ?: cachedVoices)
                             if (voices != null && voices.isNotEmpty()) {
                                 // Find first local (non-network) voice
                                 val defaultVoice = voices
@@ -560,7 +564,15 @@ class TtsPlugin(private val activity: Activity) : Plugin(activity), TextToSpeech
                                     Log.w(TAG, "  No local voices available, using engine default")
                                 }
                             } else {
-                                Log.w(TAG, "  No voices available from engine")
+                                // Engine has no voice and no cache — reinitialize and retry
+                                Log.w(TAG, "  No voices available from engine or cache. Queuing and reinitializing...")
+                                if (pendingRequests.size < MAX_PENDING_REQUESTS) {
+                                    pendingRequests.add(PendingSpeak(invoke, args))
+                                } else {
+                                    invoke.reject("TTS engine is temporarily unavailable. Please try again in a moment.")
+                                }
+                                reinitializeTts()
+                                return
                             }
                         }
                     }
@@ -1146,9 +1158,8 @@ class TtsPlugin(private val activity: Activity) : Plugin(activity), TextToSpeech
         if (tts?.isSpeaking == true) {
             if (continueInBackground) {
                 // Continue speaking — TTS engine runs as a system service in background.
-                // Notify JS so it can update UI state if needed.
+                // No event emitted: speech is not paused, no state change to report.
                 Log.d(TAG, "  App going to background while speaking — continuing in background")
-                emitEvent("speech:backgroundPause", reason = "app_paused")
             } else {
                 // User opted out of background audio — pause and notify JS.
                 Log.d(TAG, "  App going to background while speaking — pausing (continueInBackground=false)")

@@ -139,7 +139,7 @@ impl SpeakRequest {
 
         // Voice ID validation (if provided)
         if let Some(ref voice_id) = self.voice_id {
-            Self::validate_voice_id(voice_id)?;
+            validate_voice_id(voice_id)?;
         }
 
         Ok(ValidatedSpeakRequest {
@@ -162,23 +162,24 @@ impl SpeakRequest {
         }
         Ok(lang.to_string())
     }
+}
 
-    fn validate_voice_id(voice_id: &str) -> Result<(), ValidationError> {
-        if voice_id.len() > MAX_VOICE_ID_LENGTH {
-            return Err(ValidationError::VoiceIdTooLong {
-                len: voice_id.len(),
-                max: MAX_VOICE_ID_LENGTH,
-            });
-        }
-        // Only allow alphanumeric, dots, underscores, and hyphens (matches iOS validation)
-        if !voice_id
-            .chars()
-            .all(|c| c.is_alphanumeric() || c == '.' || c == '_' || c == '-')
-        {
-            return Err(ValidationError::InvalidVoiceId);
-        }
-        Ok(())
+/// Shared voice ID validation: only alphanumeric, dots, underscores, and hyphens allowed.
+/// Matches the validation in iOS (CharacterSet) and Android (VOICE_ID_PATTERN).
+fn validate_voice_id(voice_id: &str) -> Result<(), ValidationError> {
+    if voice_id.len() > MAX_VOICE_ID_LENGTH {
+        return Err(ValidationError::VoiceIdTooLong {
+            len: voice_id.len(),
+            max: MAX_VOICE_ID_LENGTH,
+        });
     }
+    if !voice_id
+        .chars()
+        .all(|c| c.is_alphanumeric() || c == '.' || c == '_' || c == '-')
+    {
+        return Err(ValidationError::InvalidVoiceId);
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
@@ -285,6 +286,9 @@ impl PreviewVoiceRequest {
     }
 
     pub fn validate(&self) -> Result<(), ValidationError> {
+        // Validate voice ID
+        validate_voice_id(&self.voice_id)?;
+
         // Validate custom text if provided
         if let Some(ref text) = self.text {
             if text.is_empty() {

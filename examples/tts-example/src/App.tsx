@@ -22,6 +22,7 @@ import {
   getVoices,
   isInitialized,
   onSpeechEvent,
+  isTtsError,
   type Voice,
 } from "tauri-plugin-tts-api";
 import type { UnlistenFn } from "@tauri-apps/api/event";
@@ -134,7 +135,7 @@ export default function App() {
       setSuccess(`Loaded ${availableVoices.length} voices`);
       setTimeout(() => setSuccess(null), 3000);
     } catch (err) {
-      setError(`Failed to load voices: ${err}`);
+      setError(`Failed to load voices: ${isTtsError(err) ? err.message : String(err)}`);
     } finally {
       setLoading(false);
     }
@@ -158,7 +159,7 @@ export default function App() {
       setTimeout(() => setSuccess(null), 2000);
     } catch (err) {
       stopSpeechListeners();
-      setError(`Failed to speak: ${err}`);
+      setError(`Failed to speak: ${isTtsError(err) ? err.message : String(err)}`);
     }
   };
 
@@ -170,7 +171,7 @@ export default function App() {
       setSuccess("Speech stopped");
       setTimeout(() => setSuccess(null), 2000);
     } catch (err) {
-      setError(`Failed to stop: ${err}`);
+      setError(`Failed to stop: ${isTtsError(err) ? err.message : String(err)}`);
     }
   };
 

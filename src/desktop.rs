@@ -94,18 +94,24 @@ pub fn init<R: Runtime, C: DeserializeOwned>(
     } = engine.supported_features();
 
     let emitter = Arc::new(EventEmitter { app: app.clone() });
+    // Shared utterance ID: set by speak(), read by callbacks to include in finish/cancel events.
+    let current_utterance_id: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
     if utterance_callbacks {
-        // Clone emitter for each callback
+        // Clone emitter and ID slot for each callback
         let end_emitter = Arc::clone(&emitter);
         let stop_emitter = Arc::clone(&emitter);
+        let end_id = Arc::clone(&current_utterance_id);
+        let stop_id = Arc::clone(&current_utterance_id);
 
         // Set up on_utterance_end callback (natural completion)
         if let Err(e) = engine.on_utterance_end(Some(Box::new(move |_utterance_id| {
+            let id = end_id.lock().ok().and_then(|g| g.clone());
             end_emitter.emit(
                 "speech:finish",
                 TtsEventPayload {
                     event_type: "speech:finish".to_string(),
+                    id,
                     ..Default::default()
                 },
             );
@@ -115,10 +121,12 @@ pub fn init<R: Runtime, C: DeserializeOwned>(
 
         // Set up on_utterance_stop callback (cancelled/interrupted)
         if let Err(e) = engine.on_utterance_stop(Some(Box::new(move |_utterance_id| {
+            let id = stop_id.lock().ok().and_then(|g| g.clone());
             stop_emitter.emit(
                 "speech:cancel",
                 TtsEventPayload {
                     event_type: "speech:cancel".to_string(),
+                    id,
                     ..Default::default()
                 },
             );
@@ -136,6 +144,7 @@ pub fn init<R: Runtime, C: DeserializeOwned>(
         engine: Mutex::new(engine),
         voice_cache: RwLock::new(None),
         has_utterance_callbacks: utterance_callbacks,
+        current_utterance_id,
     })
 }
 
@@ -144,6 +153,8 @@ pub struct Tts<R: Runtime> {
     engine: Mutex<TtsEngine>,
     voice_cache: RwLock<Option<VoiceCache>>,
     has_utterance_callbacks: bool,
+    /// Shared with utterance callbacks so finish/cancel events carry the same ID as start.
+    current_utterance_id: Arc<Mutex<Option<String>>>,
 }
 
 impl<R: Runtime> Tts<R> {
@@ -170,8 +181,11 @@ impl<R: Runtime> Tts<R> {
         // Validate input first (before acquiring lock)
         let validated = payload.validate()?;
 
-        // Generate utterance ID for tracking
-        let utterance_id = uuid::Uuid::new_v4().to_string();
+        // Generate utterance ID for tracking and share it with the utterance callbacks.
+        let utterance_id = uuid::Uuid::now_v7().to_string();
+        if let Ok(mut guard) = self.current_utterance_id.lock() {
+            *guard = Some(utterance_id.clone());
+        }
 
         let result = self.with_engine(|engine| {
             // Set voice if specified
@@ -240,7 +254,7 @@ impl<R: Runtime> Tts<R> {
     pub fn stop(&self) -> crate::Result<StopResponse> {
         self.with_engine(|engine| {
             engine.stop()?;
-            Ok(StopResponse { success: true })
+            Ok(())
         })?;
 
         // Only emit speech:cancel as a fallback for engines without utterance callbacks.

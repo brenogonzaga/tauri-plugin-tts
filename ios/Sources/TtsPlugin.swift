@@ -205,9 +205,8 @@ class TtsPlugin: Plugin, AVSpeechSynthesizerDelegate {
         if synthesizer.isSpeaking && !synthesizer.isPaused {
             if continueInBackground {
                 // Continue speaking — AVAudioSession .playback category supports background audio.
-                // Notify JS so it can update UI state if needed.
+                // No event emitted: speech is not paused, no state change to report.
                 NSLog("[TtsPlugin]   App going to background while speaking — continuing in background")
-                emitEvent("speech:backgroundPause")
             } else {
                 // User opted out of background audio — pause and notify JS.
                 NSLog("[TtsPlugin]   App going to background while speaking — pausing (continueInBackground=false)")
