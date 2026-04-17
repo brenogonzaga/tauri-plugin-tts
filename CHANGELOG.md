@@ -5,7 +5,45 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.8] - 2026-03-30
+
+### Fixed
+
+- **Android/iOS** (issue #6): Speech events (`speech:start`, `speech:finish`, etc.) now
+  correctly reach JavaScript on mobile. Two root causes were fixed:
+  1. `setupEventRelay` was called during the Rust `setup()` hook before the Android/iOS
+     plugin was ready, causing a silent failure with no channel ever registered.
+  2. The `Channel<TtsEventPayload>` Rust object was a local variable in
+     `setup_event_relay()` and was immediately dropped at the end of the function,
+     destroying the callback — so `eventChannel.send()` in Kotlin/Swift was a silent no-op.
+     Fixed by adding a `register_listener` Tauri command invoked by JS after app load (deferring
+     channel setup to when the native plugin is ready) and by storing the channel in the `Tts<R>`
+     struct (`relay_channel: Mutex<Option<Channel<TtsEventPayload>>>`) to keep it alive for the
+     plugin lifetime.
+
+## [0.1.7] - 2026-03-29
+
+### Fixed
+
+- **Android**: TTS engine bad state (voices returning `null`) is now recovered automatically
+  via `reinitializeTts()`. Previously, if the Google TTS engine entered a broken state, all
+  subsequent `speak()` calls would fail silently. The engine is now restarted from scratch
+  and the pending request is re-queued.
+- **Android/iOS**: Improved error display in the example app — errors are now surfaced to
+  the UI instead of being swallowed silently.
+- **Desktop**: `speak()` error handling improved in `desktop.rs`.
+
 ## [0.1.6] - 2026-03-29
+
+### Changed
+
+- **Android/iOS/Desktop**: Unified the internal event payload type — `SpeechEvent` (desktop)
+  and the mobile `TtsEventPayload` are now a single `TtsEventPayload` struct in `models.rs` with
+  an optional `reason` field for `speech:backgroundPause` and audio-focus events.
+- **Android**: Speech event names corrected to match iOS and the TypeScript `SpeechEventType`
+  definition: `speech:paused` → `speech:pause`, `speech:resumed` → `speech:resume`.
+- **TypeScript**: `SpeechEvent` interface now includes a `reason?: string` field populated for
+  background-pause and audio-focus events.
 
 ### Fixed
 
@@ -28,8 +66,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   before emitting `speech:finish`.
 - **Android**: `volume` parameter in `speak()` was accepted but silently ignored. It is now
   correctly passed via `TextToSpeech.Engine.KEY_PARAM_VOLUME` in the Bundle.
+- **Desktop**: `speech:start` is now emitted only after `engine.speak()` succeeds (previously
+  fired before the speak call, so a failed speak still emitted a start event).
+- **Desktop**: Duplicate `speech:cancel` events on `stop()` are no longer emitted for engines
+  that already provide utterance callbacks.
+- **All platforms**: `voiceId` in `speak()` options is now validated — must contain only
+  alphanumeric characters, `.`, `_`, or `-`. Invalid IDs are rejected with a clear error
+  instead of being silently ignored.
 
-## [0.1.5] - 2026-03-30
+## [0.1.5] - 2026-03-29
 
 ### Fixed
 
