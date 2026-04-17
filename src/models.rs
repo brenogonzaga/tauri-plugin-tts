@@ -1,5 +1,6 @@
 use serde::{Deserialize, Serialize};
 use std::borrow::Cow;
+#[cfg(feature = "ts-bindings")]
 use ts_rs::TS;
 
 /// Maximum text length in bytes (10KB)
@@ -9,8 +10,12 @@ pub const MAX_VOICE_ID_LENGTH: usize = 256;
 /// Maximum language code length
 pub const MAX_LANGUAGE_LENGTH: usize = 35;
 
-#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq, TS)]
-#[ts(export, export_to = "../guest-js/bindings/")]
+#[cfg_attr(feature = "ts-bindings", derive(TS))]
+#[cfg_attr(
+    feature = "ts-bindings",
+    ts(export, export_to = "../guest-js/bindings/")
+)]
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum QueueMode {
     /// Flush any pending speech and start speaking immediately (default)
@@ -20,8 +25,12 @@ pub enum QueueMode {
     Add,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, TS)]
-#[ts(export, export_to = "../guest-js/bindings/")]
+#[cfg_attr(feature = "ts-bindings", derive(TS))]
+#[cfg_attr(
+    feature = "ts-bindings",
+    ts(export, export_to = "../guest-js/bindings/")
+)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SpeakOptions {
     /// The text to speak (max 10,000 characters)
@@ -46,8 +55,12 @@ pub struct SpeakOptions {
     pub queue_mode: Option<QueueMode>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, TS)]
-#[ts(export, export_to = "../guest-js/bindings/")]
+#[cfg_attr(feature = "ts-bindings", derive(TS))]
+#[cfg_attr(
+    feature = "ts-bindings",
+    ts(export, export_to = "../guest-js/bindings/")
+)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PreviewVoiceOptions {
     /// Voice ID to preview
@@ -213,8 +226,12 @@ pub struct SetBackgroundBehaviorResponse {
     pub success: bool,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, TS)]
-#[ts(export, export_to = "../guest-js/bindings/")]
+#[cfg_attr(feature = "ts-bindings", derive(TS))]
+#[cfg_attr(
+    feature = "ts-bindings",
+    ts(export, export_to = "../guest-js/bindings/")
+)]
+#[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Voice {
     /// Unique identifier for the voice
@@ -254,8 +271,12 @@ pub struct IsInitializedResponse {
     pub voice_count: u32,
 }
 
-#[derive(Debug, Clone, Default, Deserialize, Serialize, TS)]
-#[ts(export, export_to = "../guest-js/bindings/")]
+#[cfg_attr(feature = "ts-bindings", derive(TS))]
+#[cfg_attr(
+    feature = "ts-bindings",
+    ts(export, export_to = "../guest-js/bindings/")
+)]
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PauseResumeResponse {
     pub success: bool,
