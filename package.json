@@ -1,6 +1,6 @@
 {
     "name": "tauri-plugin-tts-api",
-    "version": "0.1.8",
+    "version": "0.1.9",
     "author": "Affex Team",
     "description": "Native text-to-speech API for Tauri with multi-language and voice selection",
     "license": "MIT",

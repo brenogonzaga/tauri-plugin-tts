@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.9] - 2026-04-18
+
+### Fixed
+
+- **Android/iOS** (issue #8): `tts://speech:*` events now reach Rust-side listeners
+  (`app.listen("tts://speech:finish", ...)`) without any manual setup.
+  Previously, the native → Rust event relay was only activated when JS called
+  `onSpeechEvent()`, so apps that listened from Rust directly (without using the
+  JS API) never received events on mobile. The relay is now registered automatically
+  on the first `speak()` call and is idempotent — calling it multiple times is safe.
+  `setup_event_relay()` is still public but no longer needs to be called manually.
+
 ## [0.1.8] - 2026-03-30
 
 ### Fixed
