@@ -14,7 +14,7 @@ use crate::models::*;
 tauri::ios_plugin_binding!(init_plugin_tts);
 
 pub fn init<R: Runtime, C: DeserializeOwned>(
-    _app: &AppHandle<R>,
+    app: &AppHandle<R>,
     api: PluginApi<R, C>,
 ) -> crate::Result<Tts<R>> {
     #[cfg(target_os = "android")]
@@ -23,22 +23,36 @@ pub fn init<R: Runtime, C: DeserializeOwned>(
     let handle = api.register_ios_plugin(init_plugin_tts)?;
     Ok(Tts {
         handle,
+        app: app.clone(),
         relay_channel: Mutex::new(None),
     })
 }
 
 pub struct Tts<R: Runtime> {
     handle: PluginHandle<R>,
+    app: AppHandle<R>,
     /// Keeps the Channel alive so Kotlin can call send() at any point after setup.
     /// Dropping the Channel would destroy the Rust-side callback, silencing all events.
     relay_channel: Mutex<Option<Channel<TtsEventPayload>>>,
 }
 
 impl<R: Runtime> Tts<R> {
+    /// Ensures the event relay is registered exactly once. Safe to call multiple times.
+    /// Called automatically by `speak()` — users do not need to call this manually.
+    pub fn ensure_relay_registered(&self) -> crate::Result<()> {
+        if self.relay_channel.lock().unwrap().is_some() {
+            return Ok(());
+        }
+        self.setup_event_relay(&self.app.clone())
+    }
+
     /// Set up a persistent event relay: native code calls `channel.send(TtsEventPayload)`,
     /// Rust receives it and re-emits via `app.emit("tts://<event_type>", payload)` so that
     /// JS `listen("tts://speech:finish", ...)` works on mobile exactly like desktop.
     pub fn setup_event_relay(&self, app: &AppHandle<R>) -> crate::Result<()> {
+        if self.relay_channel.lock().unwrap().is_some() {
+            return Ok(());
+        }
         use tauri::ipc::InvokeResponseBody;
 
         let app_handle = app.clone();
@@ -86,6 +100,10 @@ impl<R: Runtime> Tts<R> {
     }
 
     pub fn speak(&self, payload: SpeakRequest) -> crate::Result<SpeakResponse> {
+        // Auto-register the event relay on first speak so that Rust-side listeners
+        // (e.g. app.listen("tts://speech:finish", ...)) receive events without
+        // any manual setup from the caller.
+        self.ensure_relay_registered()?;
         self.handle
             .run_mobile_plugin("speak", payload)
             .map_err(Into::into)
