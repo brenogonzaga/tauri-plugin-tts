@@ -177,8 +177,15 @@ impl SpeakRequest {
     }
 }
 
-/// Shared voice ID validation: only alphanumeric, dots, underscores, and hyphens allowed.
-/// Matches the validation in iOS (CharacterSet) and Android (VOICE_ID_PATTERN).
+/// Shared voice ID validation. The id is matched by exact equality against the
+/// engine's own voices in `speak()` / `preview_voice()`, so this only guards
+/// against pathological input (too long, or containing control characters).
+///
+/// A stricter charset filter cannot be used here: native Windows SAPI voice ids
+/// returned by `get_voices()` are registry tokens that contain spaces and
+/// backslashes (e.g. `HKEY_LOCAL_MACHINE\...\Tokens\TTS_MS_EN-US_ZIRA_11.0`), so
+/// restricting to `[alphanumeric . _ -]` rejected every selectable voice on
+/// Windows.
 fn validate_voice_id(voice_id: &str) -> Result<(), ValidationError> {
     if voice_id.len() > MAX_VOICE_ID_LENGTH {
         return Err(ValidationError::VoiceIdTooLong {
@@ -186,10 +193,7 @@ fn validate_voice_id(voice_id: &str) -> Result<(), ValidationError> {
             max: MAX_VOICE_ID_LENGTH,
         });
     }
-    if !voice_id
-        .chars()
-        .all(|c| c.is_alphanumeric() || c == '.' || c == '_' || c == '-')
-    {
+    if voice_id.chars().any(|c| c.is_control()) {
         return Err(ValidationError::InvalidVoiceId);
     }
     Ok(())
