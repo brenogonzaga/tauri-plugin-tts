@@ -273,6 +273,17 @@ sudo pacman -S speech-dispatcher
 2. Install "Google Text-to-Speech" from Play Store if missing
 3. Download language data for your desired languages
 
+### Xiaomi HyperOS and OPPO ColorOS
+**Solution:** TTS not initialized, queuing request
+1. Add the following to AndroidManifest.xml:
+``` xml
+    <queries>
+        <intent>
+            <action android:name="android.intent.action.TTS_SERVICE" />
+        </intent>
+    </queries>
+```
+
 ### iOS: Voices sound robotic
 
 **Solution:** Download enhanced voices:
