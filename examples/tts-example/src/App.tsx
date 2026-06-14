@@ -1,31 +1,25 @@
 import { useState, useEffect, useRef, useCallback } from "react";
 import {
-  Box,
-  Button,
-  TextField,
-  Select,
-  MenuItem,
-  FormControl,
-  InputLabel,
-  Slider,
-  Stack,
-  Alert,
-  CircularProgress,
-  Typography,
-  Paper,
-  Container,
-} from "@mui/material";
-import { MdPlayArrow, MdStop, MdRefresh } from "react-icons/md";
-import {
   speak,
   stop,
   getVoices,
   isInitialized,
   onSpeechEvent,
+  previewVoice,
   isTtsError,
   type Voice,
 } from "tauri-plugin-tts-api";
 import type { UnlistenFn } from "@tauri-apps/api/event";
+import "./App.css";
+
+const SAMPLES = [
+  { lang: "en", label: "EN", text: "Hello! How are you today?" },
+  { lang: "pt", label: "PT", text: "Olá! Como você está hoje?" },
+  { lang: "es", label: "ES", text: "¡Hola! ¿Cómo estás hoy?" },
+  { lang: "fr", label: "FR", text: "Bonjour! Comment allez-vous?" },
+  { lang: "de", label: "DE", text: "Hallo! Wie geht es Ihnen?" },
+  { lang: "ja", label: "JA", text: "こんにちは！お元気ですか？" },
+];
 
 export default function App() {
   const [text, setText] = useState(
@@ -38,72 +32,53 @@ export default function App() {
   const [voices, setVoices] = useState<Voice[]>([]);
   const [isSpeaking, setIsSpeaking] = useState(false);
   const [loading, setLoading] = useState(false);
-  const [ttsReady, setTtsReady] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [success, setSuccess] = useState<string | null>(null);
   const speechUnlistenRef = useRef<UnlistenFn | null>(null);
 
-  const waitForTtsInit = useCallback(async (): Promise<boolean> => {
+  const waitForTtsInit = useCallback(async () => {
     for (let i = 0; i < 20; i++) {
       try {
-        const status = await isInitialized();
-        if (status.initialized && status.voiceCount > 0) {
-          setTtsReady(true);
-          return true;
-        }
+        const s = await isInitialized();
+        if (s.initialized && s.voiceCount > 0) return;
       } catch {
-        // TTS not ready yet
+        // engine not ready yet
       }
       await new Promise((r) => setTimeout(r, 300));
     }
-    return false;
   }, []);
 
   useEffect(() => {
-    const initAndLoad = async () => {
+    const init = async () => {
       setLoading(true);
-      setError(null);
-
-      // Wait for TTS engine to be ready
       await waitForTtsInit();
-
       await loadVoices();
     };
-
-    initAndLoad();
-
+    init();
     return () => {
       speechUnlistenRef.current?.();
     };
   }, [waitForTtsInit]);
 
-  // Register speech event listeners. speech:finish and speech:error both signal end of speech.
+  // Register speech event listeners.
   // Using onSpeechEvent (instead of polling isSpeaking()) is reliable for network voices:
   // engine.isSpeaking returns false when synthesis hands off to the hardware audio buffer,
   // but audio may still be playing. The plugin's speech:finish uses a 1.5s debounce to
   // correctly detect when playback is truly done.
   const startSpeechListeners = async () => {
     speechUnlistenRef.current?.();
-
-    const [unlistenFinish, unlistenError, unlistenCancel] = await Promise.all([
-      onSpeechEvent("speech:finish", () => {
-        setIsSpeaking(false);
-        speechUnlistenRef.current = null;
-      }),
-      onSpeechEvent("speech:error", () => {
-        setIsSpeaking(false);
-        speechUnlistenRef.current = null;
-      }),
-      onSpeechEvent("speech:cancel", () => {
-        setIsSpeaking(false);
-        speechUnlistenRef.current = null;
-      }),
+    const done = () => {
+      setIsSpeaking(false);
+      speechUnlistenRef.current = null;
+    };
+    const [a, b, c] = await Promise.all([
+      onSpeechEvent("speech:finish", done),
+      onSpeechEvent("speech:error", done),
+      onSpeechEvent("speech:cancel", done),
     ]);
-
     speechUnlistenRef.current = () => {
-      unlistenFinish();
-      unlistenError();
-      unlistenCancel();
+      a();
+      b();
+      c();
     };
   };
 
@@ -115,19 +90,15 @@ export default function App() {
 
   const loadVoices = async () => {
     setLoading(true);
-    setError(null);
     try {
-      const availableVoices = await getVoices();
-      if (availableVoices.length === 0 && !ttsReady) {
-        // TTS might not be initialized yet, retry after a delay
+      const available = await getVoices();
+      if (available.length === 0) {
         setTimeout(loadVoices, 1000);
         return;
       }
-      setVoices(availableVoices);
-      setSuccess(`Loaded ${availableVoices.length} voices`);
-      setTimeout(() => setSuccess(null), 3000);
+      setVoices(available);
     } catch (err) {
-      setError(`Failed to load voices: ${isTtsError(err) ? err.message : String(err)}`);
+      setError(isTtsError(err) ? err.message : String(err));
     } finally {
       setLoading(false);
     }
@@ -147,11 +118,9 @@ export default function App() {
         queueMode: null,
       });
       setIsSpeaking(true);
-      setSuccess("Speaking started!");
-      setTimeout(() => setSuccess(null), 2000);
     } catch (err) {
       stopSpeechListeners();
-      setError(`Failed to speak: ${isTtsError(err) ? err.message : String(err)}`);
+      setError(isTtsError(err) ? err.message : String(err));
     }
   };
 
@@ -160,14 +129,21 @@ export default function App() {
     try {
       await stop();
       stopSpeechListeners();
-      setSuccess("Speech stopped");
-      setTimeout(() => setSuccess(null), 2000);
     } catch (err) {
-      setError(`Failed to stop: ${isTtsError(err) ? err.message : String(err)}`);
+      setError(isTtsError(err) ? err.message : String(err));
     }
   };
 
-  // Group voices by language
+  const handlePreview = async (voice: Voice) => {
+    setError(null);
+    try {
+      setSelectedVoiceId(voice.id);
+      await previewVoice({ voiceId: voice.id, text: text.trim() || null });
+    } catch (err) {
+      setError(isTtsError(err) ? err.message : String(err));
+    }
+  };
+
   const voicesByLanguage = voices.reduce(
     (acc, voice) => {
       const lang = voice.language.split("-")[0];
@@ -179,305 +155,235 @@ export default function App() {
   );
 
   return (
-    <Container maxWidth="md" sx={{ py: { xs: 2, sm: 3, md: 4 } }}>
-      <Paper
-        elevation={0}
-        sx={{
-          p: { xs: 2, sm: 3 },
-          mb: { xs: 2, sm: 3 },
-          borderRadius: 2,
-          background: "linear-gradient(135deg, #667eea 0%, #764ba2 100%)",
-          color: "white",
-        }}
-      >
-        <Typography
-          variant="h4"
-          component="h1"
-          sx={{
-            fontSize: { xs: "1.5rem", sm: "2rem", md: "2.125rem" },
-            fontWeight: 700,
-            mb: 1,
-          }}
-        >
-          🔊 Text-to-Speech Example
-        </Typography>
-        <Typography
-          variant="body2"
-          sx={{
-            fontSize: { xs: "0.875rem", sm: "1rem" },
-            opacity: 0.9,
-            display: { xs: "none", sm: "block" },
-          }}
-        >
-          Test the native Text-to-Speech plugin functionality
-        </Typography>
-      </Paper>
+    <div className="page">
+      <header className="header">
+        <div className="header-inner">
+          <h1 className="header-title">Text-to-Speech</h1>
+          <p className="header-subtitle">Tauri Plugin TTS — native synthesis on all platforms</p>
+        </div>
+      </header>
 
-      {error && (
-        <Alert severity="error" sx={{ mb: 2 }} onClose={() => setError(null)}>
-          {error}
-        </Alert>
-      )}
+      <main className="main">
+        {error && (
+          <div className="alert alert-error">
+            <span>{error}</span>
+            <button className="alert-close" onClick={() => setError(null)}>
+              ×
+            </button>
+          </div>
+        )}
 
-      {success && (
-        <Alert severity="success" sx={{ mb: 2 }} onClose={() => setSuccess(null)}>
-          {success}
-        </Alert>
-      )}
+        <div className="card">
+          <div className="field">
+            <label className="field-label" htmlFor="text-input">
+              Text
+            </label>
+            <textarea
+              id="text-input"
+              className="textarea"
+              rows={4}
+              value={text}
+              onChange={(e) => setText(e.target.value)}
+              placeholder="Enter text to speak..."
+            />
+          </div>
 
-      <Stack spacing={{ xs: 2, sm: 3 }}>
-        {/* Text input */}
-        <TextField
-          label="Text to speak"
-          multiline
-          rows={3}
-          value={text}
-          onChange={(e) => setText(e.target.value)}
-          fullWidth
-        />
-
-        {/* Voice selector */}
-        <FormControl fullWidth>
-          <InputLabel>Voice</InputLabel>
-          <Select
-            value={selectedVoiceId}
-            label="Voice"
-            onChange={(e) => setSelectedVoiceId(e.target.value)}
-          >
-            <MenuItem value="">
-              <em>System Default</em>
-            </MenuItem>
-            {Object.entries(voicesByLanguage).map(([lang, langVoices]) => [
-              <MenuItem
-                key={`header-${lang}`}
-                disabled
-                sx={{ fontWeight: "bold", bgcolor: "action.hover" }}
+          <div className="field">
+            <label className="field-label" htmlFor="voice-select">
+              Voice
+            </label>
+            <div className="select-wrap">
+              <select
+                id="voice-select"
+                className="select"
+                value={selectedVoiceId}
+                onChange={(e) => setSelectedVoiceId(e.target.value)}
               >
-                {lang.toUpperCase()} ({langVoices.length} voices)
-              </MenuItem>,
-              ...langVoices.map((voice) => (
-                <MenuItem key={voice.id} value={voice.id} sx={{ pl: 4 }}>
-                  {voice.name}
-                </MenuItem>
-              )),
-            ])}
-          </Select>
-        </FormControl>
+                <option value="">System Default</option>
+                {Object.entries(voicesByLanguage).map(([lang, langVoices]) => (
+                  <optgroup key={lang} label={`${lang.toUpperCase()} (${langVoices.length})`}>
+                    {langVoices.map((v) => (
+                      <option key={v.id} value={v.id}>
+                        {v.name}
+                      </option>
+                    ))}
+                  </optgroup>
+                ))}
+              </select>
+              <svg
+                className="select-chevron"
+                width="12"
+                height="12"
+                viewBox="0 0 12 12"
+                aria-hidden
+              >
+                <path
+                  d="M2 4l4 4 4-4"
+                  stroke="currentColor"
+                  strokeWidth="1.5"
+                  strokeLinecap="round"
+                  strokeLinejoin="round"
+                  fill="none"
+                />
+              </svg>
+            </div>
+          </div>
 
-        {/* Rate slider */}
-        <Box>
-          <Typography gutterBottom sx={{ fontSize: { xs: "0.875rem", sm: "1rem" } }}>
-            Rate: {rate.toFixed(2)}x
-          </Typography>
-          <Slider
-            value={rate}
-            onChange={(_, value) => setRate(value as number)}
-            min={0.25}
-            max={2.0}
-            step={0.05}
-            marks={[
-              { value: 0.25, label: "0.25x" },
-              { value: 0.5, label: "0.5x" },
-              { value: 1.0, label: "1x" },
-              { value: 2.0, label: "2x" },
-            ]}
-            sx={{
-              "& .MuiSlider-markLabel": {
-                fontSize: { xs: "0.625rem", sm: "0.75rem" },
-              },
-            }}
-          />
-        </Box>
+          <div className="sliders">
+            <SliderField
+              label="Rate"
+              value={rate}
+              display={`${rate.toFixed(2)}×`}
+              min={0.25}
+              max={2.0}
+              step={0.05}
+              onChange={setRate}
+              ticks={["0.25×", "1×", "2×"]}
+            />
+            <SliderField
+              label="Pitch"
+              value={pitch}
+              display={pitch.toFixed(1)}
+              min={0.5}
+              max={2.0}
+              step={0.1}
+              onChange={setPitch}
+              ticks={["Low", "Normal", "High"]}
+            />
+            <SliderField
+              label="Volume"
+              value={volume}
+              display={`${Math.round(volume * 100)}%`}
+              min={0}
+              max={1.0}
+              step={0.1}
+              onChange={setVolume}
+              ticks={["Mute", "50%", "100%"]}
+            />
+          </div>
 
-        {/* Pitch slider */}
-        <Box>
-          <Typography gutterBottom sx={{ fontSize: { xs: "0.875rem", sm: "1rem" } }}>
-            Pitch: {pitch.toFixed(1)}
-          </Typography>
-          <Slider
-            value={pitch}
-            onChange={(_, value) => setPitch(value as number)}
-            min={0.5}
-            max={2.0}
-            step={0.1}
-            marks={[
-              { value: 0.5, label: "Low" },
-              { value: 1.0, label: "Normal" },
-              { value: 2.0, label: "High" },
-            ]}
-            sx={{
-              "& .MuiSlider-markLabel": {
-                fontSize: { xs: "0.625rem", sm: "0.75rem" },
-              },
-            }}
-          />
-        </Box>
-
-        {/* Volume slider */}
-        <Box>
-          <Typography gutterBottom sx={{ fontSize: { xs: "0.875rem", sm: "1rem" } }}>
-            Volume: {Math.round(volume * 100)}%
-          </Typography>
-          <Slider
-            value={volume}
-            onChange={(_, value) => setVolume(value as number)}
-            min={0}
-            max={1.0}
-            step={0.1}
-            marks={[
-              { value: 0, label: "Mute" },
-              { value: 0.5, label: "50%" },
-              { value: 1.0, label: "100%" },
-            ]}
-            sx={{
-              "& .MuiSlider-markLabel": {
-                fontSize: { xs: "0.625rem", sm: "0.75rem" },
-              },
-            }}
-          />
-        </Box>
-
-        {/* Action buttons */}
-        <Stack direction={{ xs: "column", sm: "row" }} spacing={2}>
-          <Button
-            variant="contained"
-            color="primary"
-            startIcon={<MdPlayArrow />}
-            onClick={handleSpeak}
-            disabled={!text.trim() || isSpeaking}
-            fullWidth
-            sx={{ minHeight: { xs: 48, sm: 44 } }}
-          >
-            Speak
-          </Button>
-          <Button
-            variant="outlined"
-            color="secondary"
-            startIcon={<MdStop />}
-            onClick={handleStop}
-            disabled={!isSpeaking}
-            fullWidth
-            sx={{ minHeight: { xs: 48, sm: 44 } }}
-          >
-            Stop
-          </Button>
-        </Stack>
-
-        {/* Status */}
-        <Paper
-          sx={{
-            p: { xs: 1.5, sm: 2 },
-            bgcolor: isSpeaking ? "success.light" : "grey.100",
-          }}
-        >
-          <Typography
-            variant="body2"
-            textAlign="center"
-            sx={{ fontSize: { xs: "0.875rem", sm: "1rem" } }}
-          >
-            Status: {isSpeaking ? "🔊 Speaking..." : "🔇 Idle"}
-          </Typography>
-        </Paper>
-
-        {/* Voices list */}
-        <Paper sx={{ p: { xs: 1.5, sm: 2 } }}>
-          <Stack
-            direction="row"
-            justifyContent="space-between"
-            alignItems="center"
-            sx={{ mb: 2 }}
-          >
-            <Typography variant="h6">Available Voices ({voices.length})</Typography>
-            <Button
-              size="small"
-              startIcon={loading ? <CircularProgress size={16} /> : <MdRefresh />}
-              onClick={loadVoices}
-              disabled={loading}
+          <div className="actions">
+            <button
+              className="btn btn-primary"
+              onClick={handleSpeak}
+              disabled={!text.trim() || isSpeaking}
             >
-              Refresh
-            </Button>
-          </Stack>
+              Speak
+            </button>
+            <button className="btn btn-secondary" onClick={handleStop} disabled={!isSpeaking}>
+              Stop
+            </button>
+            <span className={`status-pill ${isSpeaking ? "status-pill--speaking" : ""}`}>
+              {isSpeaking ? "Speaking" : "Idle"}
+            </span>
+          </div>
+        </div>
+
+        <div className="card">
+          <div className="card-row">
+            <h2 className="card-title">
+              Voices {voices.length > 0 && `(${voices.length})`}
+            </h2>
+            <button className="btn btn-ghost" onClick={loadVoices} disabled={loading}>
+              {loading ? "Loading…" : "Refresh"}
+            </button>
+          </div>
 
           {voices.length === 0 && !loading && (
-            <Typography color="text.secondary" textAlign="center">
-              No voices found. Click refresh to load.
-            </Typography>
+            <p className="empty">No voices found. Click Refresh.</p>
           )}
 
-          <Box sx={{ maxHeight: 300, overflow: "auto" }}>
+          <div className="voices-scroll">
             {Object.entries(voicesByLanguage).map(([lang, langVoices]) => (
-              <Box key={lang} sx={{ mb: 2 }}>
-                <Typography variant="subtitle2" color="primary">
-                  {lang.toUpperCase()} ({langVoices.length})
-                </Typography>
+              <div key={lang} className="voice-group">
+                <div className="voice-group-head">
+                  <span className="badge">{lang.toUpperCase()}</span>
+                  <span className="voice-group-count">{langVoices.length}</span>
+                </div>
                 {langVoices.slice(0, 5).map((voice) => (
-                  <Button
+                  <div
                     key={voice.id}
-                    variant="text"
-                    size="small"
-                    onClick={() => setSelectedVoiceId(voice.id)}
-                    sx={{
-                      pl: 2,
-                      justifyContent: "flex-start",
-                      textTransform: "none",
-                      fontWeight: selectedVoiceId === voice.id ? "bold" : "normal",
-                      color: selectedVoiceId === voice.id ? "primary.main" : "text.primary",
-                    }}
+                    className={`voice-row ${selectedVoiceId === voice.id ? "voice-row--selected" : ""}`}
                   >
-                    • {voice.name} ({voice.language})
-                  </Button>
+                    <button
+                      className="voice-select-btn"
+                      onClick={() => setSelectedVoiceId(voice.id)}
+                    >
+                      <span className="voice-name">{voice.name}</span>
+                      <span className="voice-lang-tag">{voice.language}</span>
+                    </button>
+                    <button className="btn btn-ghost btn-sm" onClick={() => handlePreview(voice)}>
+                      Preview
+                    </button>
+                  </div>
                 ))}
                 {langVoices.length > 5 && (
-                  <Typography variant="caption" sx={{ pl: 2 }} color="text.secondary">
-                    ... and {langVoices.length - 5} more
-                  </Typography>
+                  <span className="voice-overflow">+{langVoices.length - 5} more</span>
                 )}
-              </Box>
+              </div>
             ))}
-          </Box>
-        </Paper>
+          </div>
+        </div>
 
-        {/* Sample phrases */}
-        <Paper sx={{ p: { xs: 1.5, sm: 2 }, mt: { xs: 2, sm: 3 } }}>
-          <Typography
-            variant="h6"
-            gutterBottom
-            sx={{ fontSize: { xs: "1rem", sm: "1.25rem" } }}
-          >
-            Sample Phrases (click to set text)
-          </Typography>
-          <Stack spacing={1}>
-            {[
-              { lang: "en", text: "Hello! How are you today?" },
-              { lang: "pt", text: "Olá! Como você está hoje?" },
-              { lang: "es", text: "¡Hola! ¿Cómo estás hoy?" },
-              { lang: "fr", text: "Bonjour! Comment allez-vous?" },
-              { lang: "de", text: "Hallo! Wie geht es Ihnen?" },
-              { lang: "ja", text: "こんにちは！お元気ですか？" },
-            ].map((sample) => {
-              // Find first voice for this language
-              const langVoices = voicesByLanguage[sample.lang] || [];
-              const firstVoice = langVoices[0];
+        <div className="card">
+          <h2 className="card-title" style={{ marginBottom: 4 }}>
+            Sample Phrases
+          </h2>
+          <div className="samples">
+            {SAMPLES.map((s) => {
+              const firstVoice = (voicesByLanguage[s.lang] || [])[0];
               return (
-                <Button
-                  key={sample.lang}
-                  variant="text"
-                  size="small"
+                <button
+                  key={s.lang}
+                  className="sample-btn"
                   onClick={() => {
-                    setText(sample.text);
-                    if (firstVoice) {
-                      setSelectedVoiceId(firstVoice.id);
-                    }
+                    setText(s.text);
+                    if (firstVoice) setSelectedVoiceId(firstVoice.id);
                   }}
-                  sx={{ justifyContent: "flex-start", textTransform: "none" }}
                 >
-                  [{sample.lang.toUpperCase()}] {sample.text}
-                </Button>
+                  <span className="badge badge--sm">{s.label}</span>
+                  <span className="sample-text">{s.text}</span>
+                </button>
               );
             })}
-          </Stack>
-        </Paper>
-      </Stack>
-    </Container>
+          </div>
+        </div>
+      </main>
+    </div>
+  );
+}
+
+interface SliderFieldProps {
+  label: string;
+  value: number;
+  display: string;
+  min: number;
+  max: number;
+  step: number;
+  onChange: (v: number) => void;
+  ticks: [string, string, string];
+}
+
+function SliderField({ label, value, display, min, max, step, onChange, ticks }: SliderFieldProps) {
+  return (
+    <div className="slider-field">
+      <div className="slider-head">
+        <label className="field-label">{label}</label>
+        <span className="slider-val">{display}</span>
+      </div>
+      <input
+        type="range"
+        min={min}
+        max={max}
+        step={step}
+        value={value}
+        onChange={(e) => onChange(Number(e.target.value))}
+      />
+      <div className="slider-ticks">
+        <span>{ticks[0]}</span>
+        <span>{ticks[1]}</span>
+        <span>{ticks[2]}</span>
+      </div>
+    </div>
   );
 }
