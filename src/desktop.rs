@@ -75,27 +75,62 @@ fn language_matches(voice_language: &str, filter: &str) -> bool {
         .starts_with(&filter.to_lowercase())
 }
 
+/// Applies the optional language filter by locale prefix, the same rule `speak()` uses to
+/// resolve a `language` to a voice — a substring match here made `getVoices("US")` return
+/// the `en-US` voices, and disagreed with what `speak({ language: "US" })` would pick.
+fn filter_voices(voices: &[Voice], language: &Option<String>) -> GetVoicesResponse {
+    let filtered: Vec<Voice> = voices
+        .iter()
+        .filter(|v| match language {
+            Some(filter) => language_matches(&v.language, filter),
+            None => true,
+        })
+        .cloned()
+        .collect();
+
+    GetVoicesResponse { voices: filtered }
+}
+
+/// Turn an engine construction failure into something the user can act on.
+fn unavailable_reason(e: tts::Error) -> String {
+    #[cfg(target_os = "linux")]
+    {
+        let err_msg = e.to_string();
+        if err_msg.contains("speech-dispatcher") || err_msg.contains("Speech Dispatcher") {
+            return "Speech Dispatcher not available. Please install it:\n\
+                Ubuntu/Debian: sudo apt install speech-dispatcher\n\
+                Fedora: sudo dnf install speech-dispatcher\n\
+                Arch: sudo pacman -S speech-dispatcher"
+                .to_string();
+        }
+    }
+    format!("TTS engine unavailable: {e}")
+}
+
 pub fn init<R: Runtime, C: DeserializeOwned>(
     app: &AppHandle<R>,
     _api: PluginApi<R, C>,
 ) -> crate::Result<Tts<R>> {
-    let engine = TtsEngine::default().map_err(|e| {
-        // Provide better error message for Linux when speech-dispatcher is not installed
-        #[cfg(target_os = "linux")]
-        {
-            let err_msg = e.to_string();
-            if err_msg.contains("speech-dispatcher") || err_msg.contains("Speech Dispatcher") {
-                return crate::Error::OperationFailed(
-                    "Speech Dispatcher not available. Please install it:\n\
-                    Ubuntu/Debian: sudo apt install speech-dispatcher\n\
-                    Fedora: sudo dnf install speech-dispatcher\n\
-                    Arch: sudo pacman -S speech-dispatcher"
-                        .to_string(),
-                );
-            }
+    // Shared utterance ID: set by speak(), read by callbacks to include in finish/cancel events.
+    let current_utterance_id: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+
+    // A missing system synthesiser (no speech-dispatcher on Linux, most commonly) must not
+    // take the whole app down with it.
+    let engine = match TtsEngine::default() {
+        Ok(engine) => engine,
+        Err(e) => {
+            let reason = unavailable_reason(e);
+            log::warn!("TTS plugin loaded in a degraded state: {reason}");
+            return Ok(Tts {
+                app: app.clone(),
+                engine: None,
+                init_error: Some(reason),
+                voice_cache: RwLock::new(None),
+                has_utterance_callbacks: false,
+                current_utterance_id,
+            });
         }
-        crate::Error::from(e)
-    })?;
+    };
 
     // Set up utterance callbacks if supported
     let Features {
@@ -104,8 +139,6 @@ pub fn init<R: Runtime, C: DeserializeOwned>(
     } = engine.supported_features();
 
     let emitter = Arc::new(EventEmitter { app: app.clone() });
-    // Shared utterance ID: set by speak(), read by callbacks to include in finish/cancel events.
-    let current_utterance_id: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
 
     if utterance_callbacks {
         // Clone emitter and ID slot for each callback
@@ -151,7 +184,8 @@ pub fn init<R: Runtime, C: DeserializeOwned>(
 
     Ok(Tts {
         app: app.clone(),
-        engine: Mutex::new(engine),
+        engine: Some(Mutex::new(engine)),
+        init_error: None,
         voice_cache: RwLock::new(None),
         has_utterance_callbacks: utterance_callbacks,
         current_utterance_id,
@@ -160,7 +194,8 @@ pub fn init<R: Runtime, C: DeserializeOwned>(
 
 pub struct Tts<R: Runtime> {
     app: AppHandle<R>,
-    engine: Mutex<TtsEngine>,
+    engine: Option<Mutex<TtsEngine>>,
+    init_error: Option<String>,
     voice_cache: RwLock<Option<VoiceCache>>,
     has_utterance_callbacks: bool,
     /// Shared with utterance callbacks so finish/cancel events carry the same ID as start.
@@ -173,10 +208,14 @@ impl<R: Runtime> Tts<R> {
     where
         F: FnOnce(&mut TtsEngine) -> crate::Result<T>,
     {
-        let mut engine = self
-            .engine
-            .lock()
-            .map_err(|_| crate::Error::MutexPoisoned)?;
+        let engine = self.engine.as_ref().ok_or_else(|| {
+            crate::Error::OperationFailed(
+                self.init_error
+                    .clone()
+                    .unwrap_or_else(|| "TTS engine unavailable".to_string()),
+            )
+        })?;
+        let mut engine = engine.lock().map_err(|_| crate::Error::MutexPoisoned)?;
         f(&mut engine)
     }
 
@@ -193,9 +232,6 @@ impl<R: Runtime> Tts<R> {
 
         // Generate utterance ID for tracking and share it with the utterance callbacks.
         let utterance_id = uuid::Uuid::now_v7().to_string();
-        if let Ok(mut guard) = self.current_utterance_id.lock() {
-            *guard = Some(utterance_id.clone());
-        }
 
         let result = self.with_engine(|engine| {
             // An explicit voice id wins; otherwise fall back to the first voice
@@ -245,6 +281,14 @@ impl<R: Runtime> Tts<R> {
             let interrupt = validated.queue_mode != QueueMode::Add;
 
             engine.speak(&validated.text, interrupt)?;
+
+            // Publish the ID only once speak() has returned. Under `flush`, speak() stops the
+            // previous utterance first and that stop fires on_utterance_stop — publishing
+            // beforehand made the resulting speech:cancel carry the ID of the utterance that
+            // was just starting, so JS saw cancel{X} → start{X} → finish{X} for a single X.
+            if let Ok(mut guard) = self.current_utterance_id.lock() {
+                *guard = Some(utterance_id.clone());
+            }
 
             Ok(SpeakResponse {
                 success: true,
@@ -297,7 +341,7 @@ impl<R: Runtime> Tts<R> {
                 .map_err(|_| crate::Error::MutexPoisoned)?;
             if let Some(ref c) = *cache {
                 if c.is_valid() {
-                    return Ok(self.filter_voices(&c.voices, &payload.language));
+                    return Ok(filter_voices(&c.voices, &payload.language));
                 }
             }
         }
@@ -324,25 +368,7 @@ impl<R: Runtime> Tts<R> {
             *cache = Some(VoiceCache::new(voices.clone()));
         }
 
-        Ok(self.filter_voices(&voices, &payload.language))
-    }
-
-    fn filter_voices(&self, voices: &[Voice], language: &Option<String>) -> GetVoicesResponse {
-        let filtered: Vec<Voice> = voices
-            .iter()
-            .filter(|v| {
-                if let Some(ref lang_filter) = language {
-                    v.language
-                        .to_lowercase()
-                        .contains(&lang_filter.to_lowercase())
-                } else {
-                    true
-                }
-            })
-            .cloned()
-            .collect();
-
-        GetVoicesResponse { voices: filtered }
+        Ok(filter_voices(&voices, &payload.language))
     }
 
     pub fn is_speaking(&self) -> crate::Result<IsSpeakingResponse> {
@@ -353,7 +379,12 @@ impl<R: Runtime> Tts<R> {
     }
 
     pub fn is_initialized(&self) -> crate::Result<IsInitializedResponse> {
-        // Desktop TTS is always initialized after construction
+        if self.engine.is_none() {
+            return Ok(IsInitializedResponse {
+                initialized: false,
+                voice_count: 0,
+            });
+        }
         // Get voice count from cache or fetch
         let voice_count = self
             .get_voices(GetVoicesRequest { language: None })
@@ -461,6 +492,41 @@ mod tests {
         assert_eq!(scale_volume(1.0, -100.0, 100.0), 100.0);
         assert_eq!(scale_volume(0.0, -100.0, 100.0), -100.0);
         assert_eq!(scale_volume(0.5, -100.0, 100.0), 0.0);
+    }
+
+    /// The reason has to survive into the message, since it is all the caller
+    /// gets once the plugin loads without an engine.
+    #[test]
+    fn unavailable_reason_keeps_the_underlying_error() {
+        let reason = unavailable_reason(tts::Error::UnsupportedFeature);
+        assert!(reason.contains("Unsupported feature"), "{reason}");
+    }
+
+    /// getVoices() must select exactly what speak({ language }) would have picked.
+    #[test]
+    fn get_voices_filter_matches_by_prefix_not_substring() {
+        let voices: Vec<Voice> = ["en-US", "pt-BR", "pt-PT"]
+            .iter()
+            .map(|lang| Voice {
+                id: lang.to_string(),
+                name: lang.to_string(),
+                language: lang.to_string(),
+            })
+            .collect();
+
+        let ids = |filter: Option<&str>| {
+            filter_voices(&voices, &filter.map(str::to_string))
+                .voices
+                .into_iter()
+                .map(|v| v.id)
+                .collect::<Vec<_>>()
+        };
+
+        assert_eq!(ids(None).len(), 3);
+        assert_eq!(ids(Some("pt")), ["pt-BR", "pt-PT"]);
+        assert_eq!(ids(Some("pt-BR")), ["pt-BR"]);
+        // "US" is a substring of "en-US" but not a locale prefix, so it selects nothing.
+        assert!(ids(Some("US")).is_empty());
     }
 
     #[test]

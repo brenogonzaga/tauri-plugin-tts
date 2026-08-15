@@ -111,6 +111,7 @@ impl<R: Runtime> Tts<R> {
     }
 
     pub fn speak(&self, payload: SpeakRequest) -> crate::Result<SpeakResponse> {
+        let payload = SpeakRequest::from(payload.validate()?);
         // Auto-register the event relay on first speak so that Rust-side listeners
         // (e.g. app.listen("tts://speech:finish", ...)) receive events without
         // any manual setup from the caller.
@@ -157,6 +158,8 @@ impl<R: Runtime> Tts<R> {
     }
 
     pub fn preview_voice(&self, payload: PreviewVoiceRequest) -> crate::Result<SpeakResponse> {
+        payload.validate()?;
+        self.ensure_relay_registered()?;
         self.handle
             .run_mobile_plugin("previewVoice", payload)
             .map_err(Into::into)

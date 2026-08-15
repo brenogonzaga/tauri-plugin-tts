@@ -179,9 +179,10 @@ impl SpeakRequest {
     }
 
     fn validate_language(lang: &str) -> Result<String, ValidationError> {
-        if lang.len() > MAX_LANGUAGE_LENGTH {
+        let len = lang.chars().count();
+        if len > MAX_LANGUAGE_LENGTH {
             return Err(ValidationError::LanguageTooLong {
-                len: lang.len(),
+                len,
                 max: MAX_LANGUAGE_LENGTH,
             });
         }
@@ -189,19 +190,35 @@ impl SpeakRequest {
     }
 }
 
+/// Rebuilds the wire payload from a validated request, so mobile receives values that
+/// already went through the shared clamping instead of clamping differently per platform.
+impl From<ValidatedSpeakRequest> for SpeakRequest {
+    fn from(v: ValidatedSpeakRequest) -> Self {
+        SpeakRequest {
+            text: v.text,
+            language: v.language,
+            voice_id: v.voice_id,
+            rate: v.rate,
+            pitch: v.pitch,
+            volume: v.volume,
+            queue_mode: v.queue_mode,
+        }
+    }
+}
+
 /// Shared voice ID validation. The id is matched by exact equality against the
 /// engine's own voices in `speak()` / `preview_voice()`, so this only guards
 /// against pathological input (too long, or containing control characters).
 ///
-/// A stricter charset filter cannot be used here: native Windows SAPI voice ids
-/// returned by `get_voices()` are registry tokens that contain spaces and
-/// backslashes (e.g. `HKEY_LOCAL_MACHINE\...\Tokens\TTS_MS_EN-US_ZIRA_11.0`), so
-/// restricting to `[alphanumeric . _ -]` rejected every selectable voice on
-/// Windows.
+/// A stricter charset filter cannot be used here: native Windows voice ids returned
+/// by `get_voices()` are registry tokens that contain spaces and backslashes (e.g.
+/// `HKEY_LOCAL_MACHINE\...\Tokens\TTS_MS_EN-US_ZIRA_11.0`), so restricting to
+/// `[alphanumeric . _ -]` rejected every selectable voice on Windows.
 fn validate_voice_id(voice_id: &str) -> Result<(), ValidationError> {
-    if voice_id.len() > MAX_VOICE_ID_LENGTH {
+    let len = voice_id.chars().count();
+    if len > MAX_VOICE_ID_LENGTH {
         return Err(ValidationError::VoiceIdTooLong {
-            len: voice_id.len(),
+            len,
             max: MAX_VOICE_ID_LENGTH,
         });
     }
@@ -601,6 +618,67 @@ mod tests {
             };
             assert!(request.validate().is_ok(), "rejected {id}");
         }
+    }
+
+    /// The 10 KB cap is documented in bytes, and mobile now receives the payload only
+    /// after this validator ran, so this is the single definition of the limit.
+    #[test]
+    fn test_text_limit_is_measured_in_bytes() {
+        // 4000 CJK characters = 12000 UTF-8 bytes: under a character limit, over a byte one.
+        let request = SpeakRequest {
+            text: "日".repeat(4_000),
+            language: None,
+            voice_id: None,
+            rate: 1.0,
+            pitch: 1.0,
+            volume: 1.0,
+            queue_mode: QueueMode::Flush,
+        };
+        assert!(matches!(
+            request.validate().unwrap_err(),
+            ValidationError::TextTooLong { .. }
+        ));
+    }
+
+    /// voiceId / language are capped in characters, so a multi-byte id that fits the
+    /// documented limit must not be rejected for its UTF-8 size.
+    #[test]
+    fn test_voice_id_limit_is_measured_in_characters() {
+        let request = PreviewVoiceRequest {
+            voice_id: "é".repeat(MAX_VOICE_ID_LENGTH),
+            text: None,
+        };
+        assert!(request.validate().is_ok());
+
+        let too_long = PreviewVoiceRequest {
+            voice_id: "é".repeat(MAX_VOICE_ID_LENGTH + 1),
+            text: None,
+        };
+        assert!(matches!(
+            too_long.validate().unwrap_err(),
+            ValidationError::VoiceIdTooLong { .. }
+        ));
+    }
+
+    /// Mobile forwards this rebuilt request, so the clamping must survive the round trip.
+    #[test]
+    fn test_validated_request_converts_back_with_clamped_values() {
+        let request = SpeakRequest {
+            text: "Hello".to_string(),
+            language: Some("pt-BR".to_string()),
+            voice_id: None,
+            rate: 99.0,
+            pitch: 0.1,
+            volume: 5.0,
+            queue_mode: QueueMode::Add,
+        };
+        let wire = SpeakRequest::from(request.validate().unwrap());
+        assert_eq!(wire.rate, 4.0);
+        assert_eq!(wire.pitch, 0.5);
+        assert_eq!(wire.volume, 1.0);
+        assert_eq!(wire.text, "Hello");
+        assert_eq!(wire.language, Some("pt-BR".to_string()));
+        assert_eq!(wire.queue_mode, QueueMode::Add);
     }
 
     #[test]

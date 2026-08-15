@@ -23,7 +23,7 @@ enum TtsValidationError: Error, LocalizedError {
         case .emptyText:
             return "Text cannot be empty"
         case .textTooLong(let length, let max):
-            return "Text too long: \(length) characters (max: \(max))"
+            return "Text too long: \(length) bytes (max: \(max))"
         case .voiceIdTooLong(let length, let max):
             return "Voice ID too long: \(length) characters (max: \(max))"
         case .invalidVoiceIdFormat:
@@ -49,8 +49,9 @@ private struct InputValidator {
         if text.isEmpty {
             throw TtsValidationError.emptyText
         }
-        if text.count > maxTextLength {
-            throw TtsValidationError.textTooLong(length: text.count, max: maxTextLength)
+        let length = text.utf8.count
+        if length > maxTextLength {
+            throw TtsValidationError.textTooLong(length: length, max: maxTextLength)
         }
     }
     
@@ -137,7 +138,8 @@ class SetupEventRelayArgs: Decodable {
 
 class TtsPlugin: Plugin, AVSpeechSynthesizerDelegate {
     private let synthesizer = AVSpeechSynthesizer()
-    private var currentUtteranceId: String?
+    private var utteranceIds = [ObjectIdentifier: String]()
+    private let utteranceIdsLock = NSLock()
     private var wasInterrupted: Bool = false
     private var isInForeground: Bool = true
     private var continueInBackground: Bool = true
@@ -204,6 +206,12 @@ class TtsPlugin: Plugin, AVSpeechSynthesizerDelegate {
                 // Continue speaking — AVAudioSession .playback category supports background audio.
                 // No event emitted: speech is not paused, no state change to report.
                 NSLog("[TtsPlugin]   App going to background while speaking — continuing in background")
+                let modes = Bundle.main.object(forInfoDictionaryKey: "UIBackgroundModes") as? [String]
+                if modes?.contains("audio") != true {
+                    NSLog("[TtsPlugin]   WARNING: Info.plist has no UIBackgroundModes 'audio' entry — "
+                        + "speech will stop when the app is suspended. Add it, or call "
+                        + "setBackgroundBehavior({ continueInBackground: false }).")
+                }
             } else {
                 // User opted out of background audio — pause and notify JS.
                 NSLog("[TtsPlugin]   App going to background while speaking — pausing (continueInBackground=false)")
@@ -311,23 +319,38 @@ class TtsPlugin: Plugin, AVSpeechSynthesizerDelegate {
         NotificationCenter.default.removeObserver(self)
     }
     
+    /// Assigns a fresh event ID to `utterance` and records it for the delegate callbacks.
+    private func trackUtterance(_ utterance: AVSpeechUtterance) -> String {
+        let id = UUID().uuidString
+        utteranceIdsLock.lock()
+        utteranceIds[ObjectIdentifier(utterance)] = id
+        utteranceIdsLock.unlock()
+        return id
+    }
+
+    /// Looks up the event ID of `utterance`, forgetting it once the utterance is over.
+    private func utteranceId(of utterance: AVSpeechUtterance, done: Bool = false) -> String? {
+        utteranceIdsLock.lock()
+        defer { utteranceIdsLock.unlock() }
+        let key = ObjectIdentifier(utterance)
+        return done ? utteranceIds.removeValue(forKey: key) : utteranceIds[key]
+    }
+
     func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didStart utterance: AVSpeechUtterance) {
-        emitEvent("speech:start", id: currentUtteranceId)
+        emitEvent("speech:start", id: utteranceId(of: utterance))
         NSLog("[TtsPlugin] Speech started")
     }
-    
+
     func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didFinish utterance: AVSpeechUtterance) {
-        emitEvent("speech:finish", id: currentUtteranceId)
-        currentUtteranceId = nil
+        emitEvent("speech:finish", id: utteranceId(of: utterance, done: true))
         NSLog("[TtsPlugin] Speech finished")
-        
+
         // Optionally deactivate audio session to allow other audio
         // try? AVAudioSession.sharedInstance().setActive(false, options: .notifyOthersOnDeactivation)
     }
-    
+
     func speechSynthesizer(_ synthesizer: AVSpeechSynthesizer, didCancel utterance: AVSpeechUtterance) {
-        emitEvent("speech:cancel", id: currentUtteranceId)
-        currentUtteranceId = nil
+        emitEvent("speech:cancel", id: utteranceId(of: utterance, done: true))
         NSLog("[TtsPlugin] Speech cancelled")
     }
     
@@ -371,9 +394,8 @@ class TtsPlugin: Plugin, AVSpeechSynthesizerDelegate {
         }
         
         let utterance = AVSpeechUtterance(string: args.text)
-        
-        currentUtteranceId = UUID().uuidString
-        
+        let utteranceId = trackUtterance(utterance)
+
         var warning: String? = nil
         
         if let voiceId = args.voiceId {
@@ -401,7 +423,7 @@ class TtsPlugin: Plugin, AVSpeechSynthesizerDelegate {
         
         var response: [String: Any] = [
             "success": true,
-            "utteranceId": currentUtteranceId as Any
+            "utteranceId": utteranceId
         ]
         if let w = warning {
             response["warning"] = w
@@ -477,7 +499,7 @@ class TtsPlugin: Plugin, AVSpeechSynthesizerDelegate {
             let languageFilter = args.language?.lowercased()
             let voiceLanguage = voice.language.lowercased()
             
-            if languageFilter == nil || voiceLanguage.contains(languageFilter!) {
+            if languageFilter == nil || voiceLanguage.hasPrefix(languageFilter!) {
                 voices.append([
                     "id": voice.identifier,
                     "name": voice.name,
@@ -534,8 +556,8 @@ class TtsPlugin: Plugin, AVSpeechSynthesizerDelegate {
         }
         
         let utterance = AVSpeechUtterance(string: args.sampleText)
-        currentUtteranceId = UUID().uuidString
-        
+        _ = trackUtterance(utterance)
+
         if let voice = AVSpeechSynthesisVoice.speechVoices().first(where: { $0.identifier == args.voiceId }) {
             utterance.voice = voice
             NSLog("[TtsPlugin]   Voice found: \(voice.name)")

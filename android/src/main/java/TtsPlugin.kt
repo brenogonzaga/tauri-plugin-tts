@@ -73,7 +73,8 @@ private const val PENDING_TIMEOUT_MS = 30_000L
 internal object InputValidator {
     fun validateText(text: String): String? {
         if (text.isEmpty()) return "Text cannot be empty"
-        if (text.length > MAX_TEXT_LENGTH) return "Text too long: ${text.length} bytes (max: $MAX_TEXT_LENGTH)"
+        val length = text.toByteArray(Charsets.UTF_8).size
+        if (length > MAX_TEXT_LENGTH) return "Text too long: $length bytes (max: $MAX_TEXT_LENGTH)"
         return null
     }
     
@@ -128,7 +129,6 @@ class TtsPlugin(private val activity: Activity) : Plugin(activity), TextToSpeech
     private var isInitialized = false
     private var isForeground = true
     private var continueInBackground = true
-    private var isPaused = false
     // Relay channel: forwards events to Rust app.emit() so JS listen() works on mobile.
     private var eventChannel: Channel? = null
     private val pendingRequests = ConcurrentLinkedQueue<PendingSpeak>()
@@ -137,13 +137,17 @@ class TtsPlugin(private val activity: Activity) : Plugin(activity), TextToSpeech
     private var cachedVoices: Set<Voice>? = null
     private var lastVoiceId: String? = null
     private val engineParams = EngineParams()
-    private var wasPlayingBeforeInterruption = false
     @Volatile private var lastUtteranceId: String? = null
-    // Shared flags between UtteranceProgressListener (background thread) and polling (main thread).
-    // @Volatile ensures cross-thread visibility; compareAndSet semantics via the check-then-set
-    // pattern prevent duplicate speech:start / speech:finish events on real devices.
-    @Volatile private var startEmitted = false
-    @Volatile private var finishEmitted = false
+    // The utterance whose speech:start / terminal event has already gone out. Shared between
+    // UtteranceProgressListener (background thread) and polling (main thread); @Volatile gives
+    // cross-thread visibility and the check-then-set pattern deduplicates events.
+    //
+    // Keyed by utterance id rather than a plain Boolean: under QUEUE_FLUSH the outgoing
+    // utterance's onStop() fires *after* its replacement was queued, so a global "finished"
+    // flag got consumed by the utterance being cancelled and permanently swallowed the
+    // speech:finish of the one that replaced it.
+    @Volatile private var startedId: String? = null
+    @Volatile private var finishedId: String? = null
 
 
     private val audioFocusChangeListener = AudioManager.OnAudioFocusChangeListener { focusChange ->
@@ -151,36 +155,30 @@ class TtsPlugin(private val activity: Activity) : Plugin(activity), TextToSpeech
             AudioManager.AUDIOFOCUS_LOSS -> {
                 // Permanent loss - another app took focus
                 Log.d(TAG, "Audio focus LOST permanently")
-                wasPlayingBeforeInterruption = tts?.isSpeaking == true
                 tts?.stop()
                 emitEvent("speech:interrupted", reason = "audio_focus_lost")
             }
             AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> {
-                // Temporary loss - e.g., phone call
+                // Temporary loss - e.g., phone call. Android TTS has no pause, so the only way
+                // to actually stop talking over the interruption is to stop the utterance.
                 Log.d(TAG, "Audio focus LOST transiently (phone call, notification, etc.)")
-                wasPlayingBeforeInterruption = tts?.isSpeaking == true
-                if (wasPlayingBeforeInterruption) {
-                    pauseSpeakingInternal()
-                    emitEvent("speech:pause", reason = "audio_focus_transient_loss")
+                if (tts?.isSpeaking == true) {
+                    tts?.stop()
+                    emitEvent("speech:interrupted", reason = "audio_focus_transient_loss")
                 }
             }
             AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
-                // We could lower volume, but for TTS it's better to pause
-                Log.d(TAG, "Audio focus LOSS_TRANSIENT_CAN_DUCK - pausing speech")
-                wasPlayingBeforeInterruption = tts?.isSpeaking == true
-                if (wasPlayingBeforeInterruption) {
-                    pauseSpeakingInternal()
-                    emitEvent("speech:pause", reason = "audio_focus_duck")
+                // We could lower volume, but for TTS it's better to stop
+                Log.d(TAG, "Audio focus LOSS_TRANSIENT_CAN_DUCK - stopping speech")
+                if (tts?.isSpeaking == true) {
+                    tts?.stop()
+                    emitEvent("speech:interrupted", reason = "audio_focus_duck")
                 }
             }
             AudioManager.AUDIOFOCUS_GAIN -> {
-                // Regained focus - resume if we were playing before
+                // Nothing to resume: the interrupted utterance was stopped, and Android
+                // offers no way to restart it from where it left off.
                 Log.d(TAG, "Audio focus GAINED")
-                if (wasPlayingBeforeInterruption && isPaused) {
-                    resumeSpeakingInternal()
-                    emitEvent("speech:resume", reason = "audio_focus_regained")
-                }
-                wasPlayingBeforeInterruption = false
             }
         }
     }
@@ -249,50 +247,53 @@ class TtsPlugin(private val activity: Activity) : Plugin(activity), TextToSpeech
         tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
             override fun onStart(utteranceId: String?) {
                 Log.d(TAG, "✓ UtteranceProgressListener.onStart() CALLED: $utteranceId")
-                if (!startEmitted) {
-                    startEmitted = true
-                    emitEvent("speech:start", id = utteranceId ?: "")
-                }
+                emitStartOnce(utteranceId)
             }
-            
+
             override fun onDone(utteranceId: String?) {
                 Log.d(TAG, "✓ UtteranceProgressListener.onDone() CALLED: $utteranceId")
-                if (!finishEmitted) {
-                    finishEmitted = true
-                    emitEvent("speech:finish", id = utteranceId ?: "")
-                    releaseAudioFocus()
-                }
+                emitFinishOnce(utteranceId, "speech:finish")
             }
-            
+
             @Deprecated("Deprecated in API level 21")
             override fun onError(utteranceId: String?) {
                 Log.e(TAG, "✗ UtteranceProgressListener.onError() CALLED: $utteranceId")
-                if (!finishEmitted) {
-                    finishEmitted = true
-                    emitEvent("speech:error", id = utteranceId ?: "", error = "Speech synthesis error")
-                    releaseAudioFocus()
-                }
+                emitFinishOnce(utteranceId, "speech:error", error = "Speech synthesis error")
             }
-            
+
             override fun onError(utteranceId: String?, errorCode: Int) {
                 Log.e(TAG, "✗ UtteranceProgressListener.onError() CALLED: $utteranceId, code: $errorCode")
-                if (!finishEmitted) {
-                    finishEmitted = true
-                    emitEvent("speech:error", id = utteranceId ?: "", error = getErrorMessage(errorCode))
-                    releaseAudioFocus()
-                }
+                emitFinishOnce(utteranceId, "speech:error", error = getErrorMessage(errorCode))
             }
-            
+
             override fun onStop(utteranceId: String?, interrupted: Boolean) {
                 Log.d(TAG, "✓ UtteranceProgressListener.onStop() CALLED: $utteranceId, interrupted: $interrupted")
-                if (!finishEmitted) {
-                    finishEmitted = true
-                    emitEvent("speech:cancel", id = utteranceId ?: "", interrupted = interrupted)
-                    releaseAudioFocus()
-                }
+                emitFinishOnce(utteranceId, "speech:cancel", interrupted = interrupted)
             }
         })
         Log.d(TAG, "  ✓ UtteranceProgressListener registered successfully")
+    }
+
+    // Emits speech:start at most once for [utteranceId].
+    private fun emitStartOnce(utteranceId: String?) {
+        val id = utteranceId ?: return
+        if (id == startedId) return
+        startedId = id
+        emitEvent("speech:start", id = id)
+    }
+
+    // Emits a terminal event (finish / cancel / error) at most once for [utteranceId].
+    private fun emitFinishOnce(
+        utteranceId: String?,
+        eventType: String,
+        error: String? = null,
+        interrupted: Boolean? = null
+    ) {
+        val id = utteranceId ?: return
+        if (id == finishedId) return
+        finishedId = id
+        emitEvent(eventType, id = id, error = error, interrupted = interrupted)
+        if (id == lastUtteranceId) releaseAudioFocus()
     }
     
     private fun requestAudioFocus(): Boolean {
@@ -333,9 +334,7 @@ class TtsPlugin(private val activity: Activity) : Plugin(activity), TextToSpeech
         }
     }
 
-    /**
-     * Reinitialize the TTS engine from scratch.
-     */
+    // Reinitialize the TTS engine from scratch.
     private fun reinitializeTts() {
         Log.w(TAG, "reinitializeTts() - engine in bad state, restarting")
         releaseAudioFocus()
@@ -345,8 +344,8 @@ class TtsPlugin(private val activity: Activity) : Plugin(activity), TextToSpeech
         isInitialized = false
         cachedVoices = null
         lastVoiceId = null
-        startEmitted = false
-        finishEmitted = false
+        startedId = null
+        finishedId = null
         engineParams.reset()
         Log.d(TAG, "reinitializeTts() - creating new TextToSpeech instance...")
         tts = TextToSpeech(activity, this)
@@ -606,7 +605,7 @@ class TtsPlugin(private val activity: Activity) : Plugin(activity), TextToSpeech
                 // Android TTS: 1.0 is normal speed, 0.5 is half, 2.0 is double
                 // Match user API directly (no normalization needed)
                 val rate = args.rate.coerceIn(0.1f, 4.0f)
-                val pitch = args.pitch.coerceIn(0.1f, 2.0f)
+                val pitch = args.pitch.coerceIn(0.5f, 2.0f)
                 val volume = args.volume.coerceIn(0.0f, 1.0f)
                 
                 // See EngineParams: only re-apply what actually changed, but do
@@ -631,9 +630,7 @@ class TtsPlugin(private val activity: Activity) : Plugin(activity), TextToSpeech
                 
                 Log.d(TAG, "  Utterance ID: $utteranceId")
                 lastUtteranceId = utteranceId
-                startEmitted = false
-                finishEmitted = false
-                
+
                 // Determine queue mode: QUEUE_FLUSH (default) or QUEUE_ADD
                 val queueMode = if (args.queueMode.lowercase() == "add") {
                     Log.d(TAG, "  Queue mode: QUEUE_ADD")
@@ -700,8 +697,8 @@ class TtsPlugin(private val activity: Activity) : Plugin(activity), TextToSpeech
                 
                 // Polling fallback: emit speech:start / speech:finish by watching isSpeaking when
                 // UtteranceProgressListener doesn't fire (known issue with Google TTS on emulators).
-                // Uses the same startEmitted/finishEmitted flags as the listener, so exactly
-                // one path wins each event even if both fire around the same time.
+                // Goes through the same emitStartOnce/emitFinishOnce guards as the listener, so
+                // exactly one path wins each event even if both fire around the same time.
                 //
                 // On Android 14+ (API 34+), isSpeaking() returns false as soon as synthesis is
                 // handed to the hardware audio buffer — BEFORE playback actually completes. A naive
@@ -709,48 +706,48 @@ class TtsPlugin(private val activity: Activity) : Plugin(activity), TextToSpeech
                 // the caller to stop or replace audio that is still playing.
                 // Fix: debounce finish detection by requiring FINISH_DEBOUNCE_POLLS consecutive
                 // not-speaking readings before concluding that speech is truly over.
+                //
+                // Only runs for QUEUE_FLUSH: isSpeaking cannot say *which* utterance is
+                // speaking, so under QUEUE_ADD it reports the predecessor still playing and
+                // would emit speech:start for an utterance that has not begun. Queued
+                // utterances rely on the listener alone.
                 val pollStartTime = System.currentTimeMillis()
                 val FINISH_DEBOUNCE_POLLS = 15  // 15 × 100ms = 1.5 s of confirmed silence
 
-                activity.runOnUiThread {
+                if (queueMode == TextToSpeech.QUEUE_FLUSH) activity.runOnUiThread {
                     val handler = android.os.Handler(android.os.Looper.getMainLooper())
                     var notSpeakingStreak = 0
                     val poll = object : Runnable {
                         override fun run() {
                             if (utteranceId != lastUtteranceId) return  // superseded by newer speak()
-                            if (finishEmitted) return                    // already done
+                            if (utteranceId == finishedId) return         // already done
 
                             val speaking = engine.isSpeaking
                             val elapsed = System.currentTimeMillis() - pollStartTime
 
-                            if (!startEmitted && speaking) {
-                                startEmitted = true
+                            if (utteranceId != startedId && speaking) {
                                 Log.d(TAG, "Polling: speech:start for $utteranceId (+${elapsed}ms)")
-                                emitEvent("speech:start", id = utteranceId)
+                                emitStartOnce(utteranceId)
                             }
 
-                            if (startEmitted && !finishEmitted) {
+                            if (utteranceId == startedId) {
                                 if (!speaking) {
                                     notSpeakingStreak++
                                     if (notSpeakingStreak >= FINISH_DEBOUNCE_POLLS) {
-                                        finishEmitted = true
                                         Log.d(TAG, "Polling: speech:finish for $utteranceId (+${elapsed}ms, ${notSpeakingStreak} quiet polls)")
-                                        emitEvent("speech:finish", id = utteranceId)
-                                        releaseAudioFocus()
+                                        emitFinishOnce(utteranceId, "speech:finish")
                                         return
                                     }
                                 } else {
                                     notSpeakingStreak = 0  // transient false — reset streak
                                 }
-                            }
-
-                            if (!startEmitted && elapsed > 10_000L) {
-                                if (!finishEmitted) {
-                                    finishEmitted = true
-                                    Log.e(TAG, "⚠️ Polling timeout: speech never started for $utteranceId")
-                                    emitEvent("speech:error", id = utteranceId, error = "TTS engine did not start speaking after 10 seconds")
-                                    releaseAudioFocus()
-                                }
+                            } else if (elapsed > 10_000L) {
+                                Log.e(TAG, "⚠️ Polling timeout: speech never started for $utteranceId")
+                                emitFinishOnce(
+                                    utteranceId,
+                                    "speech:error",
+                                    error = "TTS engine did not start speaking after 10 seconds"
+                                )
                                 return
                             }
 
@@ -885,7 +882,7 @@ class TtsPlugin(private val activity: Activity) : Plugin(activity), TextToSpeech
                     return@forEach
                 }
                 
-                if (languageFilter == null || voiceLanguage.contains(languageFilter)) {
+                if (languageFilter == null || voiceLanguage.startsWith(languageFilter)) {
                     seenIds.add(voice.name)
                     
                     val voiceObj = JSObject()
@@ -949,93 +946,24 @@ class TtsPlugin(private val activity: Activity) : Plugin(activity), TextToSpeech
         ret.put("voiceCount", tts?.voices?.size ?: 0)
         invoke.resolve(ret)
     }
-    
+
     @Command
     fun pauseSpeaking(invoke: Invoke) {
-        try {
-            if (!isInitialized || tts == null) {
-                val ret = JSObject()
-                ret.put("success", false)
-                ret.put("reason", "TTS not initialized")
-                invoke.resolve(ret)
-                return
-            }
-            
-            val success = pauseSpeakingInternal()
-            
-            if (success) {
-                Log.d(TAG, "Speech paused successfully")
-                
-                // Emit pause event
-                emitEvent("speech:pause")
-                
-                val ret = JSObject()
-                ret.put("success", true)
-                invoke.resolve(ret)
-            } else {
-                val ret = JSObject()
-                ret.put("success", false)
-                ret.put("reason", "Failed to pause speech")
-                invoke.resolve(ret)
-            }
-        } catch (e: Exception) {
-            invoke.reject("Failed to pause: ${e.message}")
-        }
+        val ret = JSObject()
+        ret.put("success", false)
+        ret.put("reason", "Pause is not supported on Android")
+        invoke.resolve(ret)
     }
-    
-    private fun pauseSpeakingInternal(): Boolean {
-        if (tts == null) return false
-        
-        // Android pause workaround: use playSilentUtterance with QUEUE_ADD
-        // This effectively pauses by queuing silence
-        val result = tts!!.playSilentUtterance(0, TextToSpeech.QUEUE_ADD, null)
-        if (result == TextToSpeech.SUCCESS) {
-            isPaused = true
-            return true
-        }
-        return false
-    }
-    
+
     @Command
     fun resumeSpeaking(invoke: Invoke) {
-        try {
-            if (!isInitialized || tts == null) {
-                val ret = JSObject()
-                ret.put("success", false)
-                ret.put("reason", "TTS not initialized")
-                invoke.resolve(ret)
-                return
-            }
-            
-            if (!isPaused) {
-                val ret = JSObject()
-                ret.put("success", false)
-                ret.put("reason", "Speech is not paused")
-                invoke.resolve(ret)
-                return
-            }
-            
-            resumeSpeakingInternal()
-            Log.d(TAG, "Speech resumed successfully")
-            
-            // Emit resume event
-            emitEvent("speech:resume")
-            
-            val ret = JSObject()
-            ret.put("success", true)
-            invoke.resolve(ret)
-        } catch (e: Exception) {
-            invoke.reject("Failed to resume: ${e.message}")
-        }
+        val ret = JSObject()
+        ret.put("success", false)
+        ret.put("reason", "Resume is not supported on Android")
+        invoke.resolve(ret)
     }
-    
 
-    private fun resumeSpeakingInternal() {
-        // Resume is automatic - the queue continues after playSilentUtterance
-        // We just need to clear the pause flag
-        isPaused = false
-    }
-    
+
     @Command
     fun previewVoice(invoke: Invoke) {
         Log.i(TAG, "previewVoice() CALLED")
@@ -1083,12 +1011,13 @@ class TtsPlugin(private val activity: Activity) : Plugin(activity), TextToSpeech
                     invoke.resolve(ret)
                     return
                 }
-                
-                // WORKAROUND: Don't set rate/pitch to 1.0f (Google TTS bug)
-                // Just use engine defaults instead of explicitly setting to 1.0
-                
+
+                if (engineParams.needsRate(1.0f)) engine.setSpeechRate(1.0f)
+                if (engineParams.needsPitch(1.0f)) engine.setPitch(1.0f)
+
                 val utteranceId = "preview_${System.currentTimeMillis()}"
-                
+                lastUtteranceId = utteranceId
+
                 engine.speak(args.sampleText(), TextToSpeech.QUEUE_FLUSH, null, utteranceId)
                 Log.d(TAG, "  Preview started with utterance: $utteranceId")
                 
@@ -1182,9 +1111,10 @@ class TtsPlugin(private val activity: Activity) : Plugin(activity), TextToSpeech
                 // No event emitted: speech is not paused, no state change to report.
                 Log.d(TAG, "  App going to background while speaking — continuing in background")
             } else {
-                // User opted out of background audio — pause and notify JS.
-                Log.d(TAG, "  App going to background while speaking — pausing (continueInBackground=false)")
-                pauseSpeakingInternal()
+                // User opted out of background audio. Android cannot pause, so stop instead —
+                // the utterance also emits speech:cancel through the progress listener.
+                Log.d(TAG, "  App going to background while speaking — stopping (continueInBackground=false)")
+                tts?.stop()
                 emitEvent("speech:backgroundPause", reason = "app_paused")
             }
         }
