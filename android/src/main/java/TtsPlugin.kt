@@ -70,11 +70,7 @@ private const val MAX_PENDING_REQUESTS = 50
 /** Timeout for pending requests in milliseconds */
 private const val PENDING_TIMEOUT_MS = 30_000L
 
-/** Allowed pattern for voice ID (alphanumeric, dots, underscores, hyphens) */
-private val VOICE_ID_PATTERN = Regex("^[a-zA-Z0-9._-]+$")
-
-
-private object InputValidator {
+internal object InputValidator {
     fun validateText(text: String): String? {
         if (text.isEmpty()) return "Text cannot be empty"
         if (text.length > MAX_TEXT_LENGTH) return "Text too long: ${text.length} bytes (max: $MAX_TEXT_LENGTH)"
@@ -83,7 +79,7 @@ private object InputValidator {
     
     fun validateVoiceId(voiceId: String): String? {
         if (voiceId.length > MAX_VOICE_ID_LENGTH) return "Voice ID too long: ${voiceId.length} chars (max: $MAX_VOICE_ID_LENGTH)"
-        if (!VOICE_ID_PATTERN.matches(voiceId)) return "Invalid voice ID format - only alphanumeric, dots, underscores, and hyphens allowed"
+        if (voiceId.any { it.isISOControl() }) return "Invalid voice ID - control characters are not allowed"
         return null
     }
     
@@ -99,6 +95,33 @@ data class PendingSpeak(
     val timestamp: Long = System.currentTimeMillis()
 )
 
+internal class EngineParams {
+    var rate = 1.0f
+        private set
+    var pitch = 1.0f
+        private set
+
+    /** True when the engine-global rate must be re-applied; records the new value. */
+    fun needsRate(value: Float): Boolean {
+        if (value == rate) return false
+        rate = value
+        return true
+    }
+
+    /** True when the engine-global pitch must be re-applied; records the new value. */
+    fun needsPitch(value: Float): Boolean {
+        if (value == pitch) return false
+        pitch = value
+        return true
+    }
+
+    /** A replacement TextToSpeech instance starts at its own defaults. */
+    fun reset() {
+        rate = 1.0f
+        pitch = 1.0f
+    }
+}
+
 @TauriPlugin
 class TtsPlugin(private val activity: Activity) : Plugin(activity), TextToSpeech.OnInitListener {
     private var tts: TextToSpeech? = null
@@ -113,6 +136,7 @@ class TtsPlugin(private val activity: Activity) : Plugin(activity), TextToSpeech
     private var audioFocusRequest: AudioFocusRequest? = null
     private var cachedVoices: Set<Voice>? = null
     private var lastVoiceId: String? = null
+    private val engineParams = EngineParams()
     private var wasPlayingBeforeInterruption = false
     @Volatile private var lastUtteranceId: String? = null
     // Shared flags between UtteranceProgressListener (background thread) and polling (main thread).
@@ -323,6 +347,7 @@ class TtsPlugin(private val activity: Activity) : Plugin(activity), TextToSpeech
         lastVoiceId = null
         startEmitted = false
         finishEmitted = false
+        engineParams.reset()
         Log.d(TAG, "reinitializeTts() - creating new TextToSpeech instance...")
         tts = TextToSpeech(activity, this)
     }
@@ -584,30 +609,23 @@ class TtsPlugin(private val activity: Activity) : Plugin(activity), TextToSpeech
                 val pitch = args.pitch.coerceIn(0.1f, 2.0f)
                 val volume = args.volume.coerceIn(0.0f, 1.0f)
                 
-                // CRITICAL WORKAROUND: If ALL values are default (1.0), configure NOTHING
-                // Google TTS engine has a severe bug when any setter is called with default values
-                // Solution: only configure if at least one value is not default
-                val allDefaults = (rate == 1.0f && pitch == 1.0f && volume == 1.0f)
-                
-                if (allDefaults) {
-                    Log.d(TAG, "  Using engine defaults (rate=1.0, pitch=1.0, volume=1.0) - not setting anything")
+                // See EngineParams: only re-apply what actually changed, but do
+                // re-apply a return to 1.0 — these setters are engine-global.
+                if (engineParams.needsRate(rate)) {
+                    engine.setSpeechRate(rate)
+                    Log.d(TAG, "  Rate set to: $rate")
                 } else {
-                    if (rate != 1.0f) {
-                        engine.setSpeechRate(rate)
-                        Log.d(TAG, "  Rate set to: $rate")
-                    } else {
-                        Log.d(TAG, "  Rate: 1.0 (default, not set)")
-                    }
-                    
-                    if (pitch != 1.0f) {
-                        engine.setPitch(pitch)
-                        Log.d(TAG, "  Pitch set to: $pitch")
-                    } else {
-                        Log.d(TAG, "  Pitch: 1.0 (default, not set)")
-                    }
-                    
-                    Log.d(TAG, "  Volume: $volume")
+                    Log.d(TAG, "  Rate: $rate (already applied)")
                 }
+
+                if (engineParams.needsPitch(pitch)) {
+                    engine.setPitch(pitch)
+                    Log.d(TAG, "  Pitch set to: $pitch")
+                } else {
+                    Log.d(TAG, "  Pitch: $pitch (already applied)")
+                }
+
+                Log.d(TAG, "  Volume: $volume (per-utterance, via Bundle)")
 
                 val utteranceId = "tts_${System.currentTimeMillis()}"
                 

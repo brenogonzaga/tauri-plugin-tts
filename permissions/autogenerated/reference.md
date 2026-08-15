@@ -13,6 +13,7 @@ Default permissions for the TTS plugin - allows all text-to-speech operations
 - `allow-resume-speaking`
 - `allow-preview-voice`
 - `allow-register-listener`
+- `allow-set-background-behavior`
 
 ## Permission Table
 
@@ -201,6 +202,32 @@ Enables the resume_speaking command without any pre-configured scope.
 <td>
 
 Denies the resume_speaking command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`tts:allow-set-background-behavior`
+
+</td>
+<td>
+
+Enables the set_background_behavior command without any pre-configured scope.
+
+</td>
+</tr>
+
+<tr>
+<td>
+
+`tts:deny-set-background-behavior`
+
+</td>
+<td>
+
+Denies the set_background_behavior command without any pre-configured scope.
 
 </td>
 </tr>

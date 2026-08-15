@@ -12,4 +12,5 @@ permissions = [
     "allow-resume-speaking",
     "allow-preview-voice",
     "allow-register-listener",
+    "allow-set-background-behavior",
 ]

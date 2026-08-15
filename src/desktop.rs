@@ -39,30 +39,40 @@ impl<R: Runtime> EventEmitter<R> {
     }
 }
 
-/// Normalize user rate (1.0 = normal) to platform-specific rate
-/// Each platform has different rate scales:
-/// - AVFoundation (macOS): 0.1-2.0, normal = 0.5
-/// - WinRT (Windows): 0.5-6.0, normal = 1.0
-/// - SpeechDispatcher (Linux): -100 to 100, normal = 0.0
-/// - AppKit (macOS legacy): 10-500, normal = 175.0
-fn normalize_rate_for_platform(engine: &TtsEngine, user_rate: f32) -> f32 {
-    let normal = engine.normal_rate();
-    let min = engine.min_rate();
-    let max = engine.max_rate();
-
-    // User rate: 1.0 = normal, <1 = slower, >1 = faster
-    // Map user_rate to platform scale using normal_rate as anchor
-    if user_rate <= 1.0 {
-        // Map 0.25-1.0 → min-normal
-        let t = (user_rate - 0.25) / 0.75; // 0.25→0, 1.0→1
-        let t = t.clamp(0.0, 1.0);
+/// Map a user value where `1.0` means "the platform's normal" onto that
+/// platform's own scale, which differs wildly per backend:
+/// - AVFoundation (macOS): rate 0.1-2.0 normal 0.5, pitch 0.5-2.0 normal 1.0
+/// - WinRT (Windows): rate 0.5-6.0 normal 1.0, pitch 0-2 normal 1.0
+/// - SpeechDispatcher (Linux): rate and pitch -100 to 100, normal 0.0
+fn scale_anchored_at_normal(
+    user: f32,
+    user_min: f32,
+    user_max: f32,
+    min: f32,
+    normal: f32,
+    max: f32,
+) -> f32 {
+    if user <= 1.0 {
+        let t = ((user - user_min) / (1.0 - user_min)).clamp(0.0, 1.0);
         min + t * (normal - min)
     } else {
-        // Map 1.0-4.0 → normal-max
-        let t = (user_rate - 1.0) / 3.0; // 1.0→0, 4.0→1
-        let t = t.clamp(0.0, 1.0);
+        let t = ((user - 1.0) / (user_max - 1.0)).clamp(0.0, 1.0);
         normal + t * (max - normal)
     }
+}
+
+/// Volume is not anchored at "normal": our 0.0-1.0 maps straight across the
+/// platform's full range (Linux is -100..100 with normal == max == 100).
+fn scale_volume(user: f32, min: f32, max: f32) -> f32 {
+    min + user.clamp(0.0, 1.0) * (max - min)
+}
+
+/// Whether `filter` is a locale prefix of `voice_language` — both "pt" and
+/// "pt-BR" match a "pt-BR" voice. Case-insensitive.
+fn language_matches(voice_language: &str, filter: &str) -> bool {
+    voice_language
+        .to_lowercase()
+        .starts_with(&filter.to_lowercase())
 }
 
 pub fn init<R: Runtime, C: DeserializeOwned>(
@@ -188,41 +198,47 @@ impl<R: Runtime> Tts<R> {
         }
 
         let result = self.with_engine(|engine| {
-            // Set voice if specified
-            if let Some(ref voice_id) = validated.voice_id {
-                if let Ok(voices) = engine.voices() {
-                    if let Some(voice) = voices.into_iter().find(|v| v.id() == *voice_id) {
-                        let _ = engine.set_voice(&voice);
-                    }
-                }
+            // An explicit voice id wins; otherwise fall back to the first voice
+            // for `language`, which would otherwise be silently ignored here.
+            let voice = engine
+                .voices()
+                .ok()
+                .and_then(|voices| match validated.voice_id {
+                    Some(ref id) => voices.into_iter().find(|v| v.id() == *id),
+                    None => validated.language.as_deref().and_then(|lang| {
+                        voices
+                            .into_iter()
+                            .find(|v| language_matches(v.language().as_ref(), lang))
+                    }),
+                });
+            if let Some(voice) = voice {
+                let _ = engine.set_voice(&voice);
             }
 
-            // WORKAROUND: If all values are default (1.0), do not configure anything
-            // Some engines (especially Google TTS) have bugs when default values are explicitly set
-            let all_defaults =
-                validated.rate == 1.0 && validated.pitch == 1.0 && validated.volume == 1.0;
-
-            if !all_defaults {
-                if validated.rate != 1.0 {
-                    // Normalize user rate (1.0 = normal) to platform-specific scale
-                    // Each platform has different rate ranges and normal values:
-                    // - AVFoundation (macOS): 0.1-2.0, normal = 0.5
-                    // - WinRT (Windows): 0.5-6.0, normal = 1.0
-                    // - SpeechDispatcher (Linux): -100 to 100, normal = 0.0
-                    let rate_to_set = normalize_rate_for_platform(engine, validated.rate);
-                    let _ = engine.set_rate(rate_to_set);
-                }
-
-                if validated.pitch != 1.0 {
-                    // Pitch: tts library uses 0.5-2.0, same as our API (already validated/clamped)
-                    let _ = engine.set_pitch(validated.pitch);
-                }
-
-                if validated.volume != 1.0 {
-                    // Volume: both use 0.0-1.0 (already validated/clamped)
-                    let _ = engine.set_volume(validated.volume);
-                }
-            }
+            // Always set all three: the engine keeps whatever was last set, so
+            // skipping a parameter leaks the previous utterance's value into
+            // this one (a 2x-rate call would make every later call 2x too).
+            let _ = engine.set_rate(scale_anchored_at_normal(
+                validated.rate,
+                0.25,
+                4.0,
+                engine.min_rate(),
+                engine.normal_rate(),
+                engine.max_rate(),
+            ));
+            let _ = engine.set_pitch(scale_anchored_at_normal(
+                validated.pitch,
+                0.5,
+                2.0,
+                engine.min_pitch(),
+                engine.normal_pitch(),
+                engine.max_pitch(),
+            ));
+            let _ = engine.set_volume(scale_volume(
+                validated.volume,
+                engine.min_volume(),
+                engine.max_volume(),
+            ));
 
             // Determine if we should interrupt current speech
             // flush (default) = interrupt, add = queue
@@ -389,5 +405,71 @@ impl<R: Runtime> Tts<R> {
     ) -> crate::Result<SetBackgroundBehaviorResponse> {
         // Desktop has no background/foreground concept — no-op
         Ok(SetBackgroundBehaviorResponse { success: true })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // Real backend ranges, from tts 0.26 (min, normal, max).
+    const AV_RATE: (f32, f32, f32) = (0.1, 0.5, 2.0);
+    const WINRT_RATE: (f32, f32, f32) = (0.5, 1.0, 6.0);
+    const SD_PITCH: (f32, f32, f32) = (-100.0, 0.0, 100.0);
+
+    fn rate(user: f32, (min, normal, max): (f32, f32, f32)) -> f32 {
+        scale_anchored_at_normal(user, 0.25, 4.0, min, normal, max)
+    }
+
+    #[test]
+    fn normal_user_value_maps_to_the_platform_normal() {
+        assert_eq!(rate(1.0, AV_RATE), 0.5);
+        assert_eq!(rate(1.0, WINRT_RATE), 1.0);
+        // The regression that made pitch 1.0 nearly inaudible on Linux: a raw
+        // 1.0 on a -100..100 scale is not "normal", 0.0 is.
+        assert_eq!(
+            scale_anchored_at_normal(1.0, 0.5, 2.0, SD_PITCH.0, SD_PITCH.1, SD_PITCH.2),
+            0.0
+        );
+    }
+
+    #[test]
+    fn extremes_saturate_at_the_platform_bounds() {
+        assert_eq!(rate(4.0, AV_RATE), 2.0);
+        assert_eq!(rate(0.25, AV_RATE), 0.1);
+        assert_eq!(rate(99.0, WINRT_RATE), 6.0); // above our range, still clamped
+        assert_eq!(rate(0.0, WINRT_RATE), 0.5);
+        assert_eq!(
+            scale_anchored_at_normal(2.0, 0.5, 2.0, SD_PITCH.0, SD_PITCH.1, SD_PITCH.2),
+            100.0
+        );
+    }
+
+    #[test]
+    fn rate_stays_monotonic_and_matches_the_previous_tuning() {
+        assert!(rate(0.5, AV_RATE) < rate(1.0, AV_RATE));
+        assert!(rate(1.0, AV_RATE) < rate(2.0, AV_RATE));
+        // 0.25-1.0 → min-normal, unchanged from the original rate-only mapping.
+        assert_eq!(rate(0.625, AV_RATE), 0.1 + 0.5 * (0.5 - 0.1));
+    }
+
+    #[test]
+    fn volume_spans_the_full_platform_range() {
+        assert_eq!(scale_volume(1.0, 0.0, 1.0), 1.0);
+        assert_eq!(scale_volume(0.0, 0.0, 1.0), 0.0);
+        // Linux: normal == max == 100, silent == -100.
+        assert_eq!(scale_volume(1.0, -100.0, 100.0), 100.0);
+        assert_eq!(scale_volume(0.0, -100.0, 100.0), -100.0);
+        assert_eq!(scale_volume(0.5, -100.0, 100.0), 0.0);
+    }
+
+    #[test]
+    fn language_filter_matches_bare_and_full_tags() {
+        assert!(language_matches("pt-BR", "pt"));
+        assert!(language_matches("pt-BR", "pt-BR"));
+        assert!(language_matches("pt-BR", "PT-br")); // case-insensitive
+        assert!(language_matches("en-US", "en"));
+        assert!(!language_matches("en-US", "pt"));
+        assert!(!language_matches("pt-BR", "pt-PT"));
     }
 }

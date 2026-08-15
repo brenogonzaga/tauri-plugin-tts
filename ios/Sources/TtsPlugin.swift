@@ -10,8 +10,6 @@ private let maxTextLength = 10_000
 private let maxVoiceIdLength = 256
 /// Maximum language code length
 private let maxLanguageLength = 35
-/// Allowed characters in voice ID (alphanumeric, dots, underscores, hyphens)
-private let voiceIdAllowedCharacters = CharacterSet.alphanumerics.union(CharacterSet(charactersIn: "._-"))
 
 enum TtsValidationError: Error, LocalizedError {
     case emptyText
@@ -29,7 +27,7 @@ enum TtsValidationError: Error, LocalizedError {
         case .voiceIdTooLong(let length, let max):
             return "Voice ID too long: \(length) characters (max: \(max))"
         case .invalidVoiceIdFormat:
-            return "Invalid voice ID format - only alphanumeric, dots, underscores, and hyphens allowed"
+            return "Invalid voice ID - control characters are not allowed"
         case .languageTooLong(let length, let max):
             return "Language code too long: \(length) characters (max: \(max))"
         }
@@ -60,8 +58,7 @@ private struct InputValidator {
         if voiceId.count > maxVoiceIdLength {
             throw TtsValidationError.voiceIdTooLong(length: voiceId.count, max: maxVoiceIdLength)
         }
-        // Check if voice ID contains only allowed characters
-        if voiceId.unicodeScalars.contains(where: { !voiceIdAllowedCharacters.contains($0) }) {
+        if voiceId.unicodeScalars.contains(where: { CharacterSet.controlCharacters.contains($0) }) {
             throw TtsValidationError.invalidVoiceIdFormat
         }
     }
@@ -395,24 +392,10 @@ class TtsPlugin: Plugin, AVSpeechSynthesizerDelegate {
             }
         }
         
-        // WORKAROUND: If all values are default (1.0), skip configuration
-        // Allow the engine to use the system's default values
-        let allDefaults = (args.clampedRate == 1.0 && args.clampedPitch == 1.0 && args.clampedVolume == 1.0)
-        
-        if !allDefaults {
-            if args.clampedRate != 1.0 {
-                let normalizedRate = args.clampedRate * 0.5
-                utterance.rate = min(max(normalizedRate, AVSpeechUtteranceMinimumSpeechRate), AVSpeechUtteranceMaximumSpeechRate)
-            }
-            
-            if args.clampedPitch != 1.0 {
-                utterance.pitchMultiplier = args.clampedPitch
-            }
-            
-            if args.clampedVolume != 1.0 {
-                utterance.volume = args.clampedVolume
-            }
-        }
+        let normalizedRate = args.clampedRate * AVSpeechUtteranceDefaultSpeechRate
+        utterance.rate = min(max(normalizedRate, AVSpeechUtteranceMinimumSpeechRate), AVSpeechUtteranceMaximumSpeechRate)
+        utterance.pitchMultiplier = args.clampedPitch
+        utterance.volume = args.clampedVolume
         
         synthesizer.speak(utterance)
         

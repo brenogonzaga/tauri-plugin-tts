@@ -40,17 +40,25 @@ impl<R: Runtime> Tts<R> {
     /// Ensures the event relay is registered exactly once. Safe to call multiple times.
     /// Called automatically by `speak()` — users do not need to call this manually.
     pub fn ensure_relay_registered(&self) -> crate::Result<()> {
-        if self.relay_channel.lock().unwrap().is_some() {
+        if self.relay_registered()? {
             return Ok(());
         }
         self.setup_event_relay(&self.app.clone())
+    }
+
+    fn relay_registered(&self) -> crate::Result<bool> {
+        Ok(self
+            .relay_channel
+            .lock()
+            .map_err(|_| crate::Error::MutexPoisoned)?
+            .is_some())
     }
 
     /// Set up a persistent event relay: native code calls `channel.send(TtsEventPayload)`,
     /// Rust receives it and re-emits via `app.emit("tts://<event_type>", payload)` so that
     /// JS `listen("tts://speech:finish", ...)` works on mobile exactly like desktop.
     pub fn setup_event_relay(&self, app: &AppHandle<R>) -> crate::Result<()> {
-        if self.relay_channel.lock().unwrap().is_some() {
+        if self.relay_registered()? {
             return Ok(());
         }
         use tauri::ipc::InvokeResponseBody;
@@ -94,7 +102,10 @@ impl<R: Runtime> Tts<R> {
 
         // Store AFTER the mobile plugin call succeeds so the Channel is kept alive
         // for the lifetime of this Tts instance.
-        *self.relay_channel.lock().unwrap() = Some(channel);
+        *self
+            .relay_channel
+            .lock()
+            .map_err(|_| crate::Error::MutexPoisoned)? = Some(channel);
 
         Ok(())
     }

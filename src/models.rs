@@ -3,7 +3,7 @@ use std::borrow::Cow;
 #[cfg(feature = "ts-bindings")]
 use ts_rs::TS;
 
-/// Maximum text length in bytes (10KB)
+/// Maximum text length in bytes (10KB).
 pub const MAX_TEXT_LENGTH: usize = 10_000;
 /// Maximum voice ID length
 pub const MAX_VOICE_ID_LENGTH: usize = 256;
@@ -113,10 +113,22 @@ pub enum ValidationError {
     TextTooLong { len: usize, max: usize },
     #[error("Voice ID too long: {len} chars (max: {max})")]
     VoiceIdTooLong { len: usize, max: usize },
-    #[error("Invalid voice ID format - only alphanumeric, dots, underscores, and hyphens allowed")]
+    #[error("Invalid voice ID - control characters are not allowed")]
     InvalidVoiceId,
     #[error("Language code too long: {len} chars (max: {max})")]
     LanguageTooLong { len: usize, max: usize },
+}
+
+impl ValidationError {
+    pub fn code(&self) -> &'static str {
+        match self {
+            ValidationError::EmptyText => "EMPTY_TEXT",
+            ValidationError::TextTooLong { .. } => "TEXT_TOO_LONG",
+            ValidationError::VoiceIdTooLong { .. } => "VOICE_ID_TOO_LONG",
+            ValidationError::InvalidVoiceId => "INVALID_VOICE_ID",
+            ValidationError::LanguageTooLong { .. } => "LANGUAGE_TOO_LONG",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -563,12 +575,72 @@ mod tests {
         };
         assert!(valid.validate().is_ok());
 
-        // Invalid voice_id
+        // Control characters are the only rejected shape (see validate_voice_id).
         let invalid = PreviewVoiceRequest {
-            voice_id: "invalid<script>".to_string(),
+            voice_id: "voice\u{7}id".to_string(),
             text: None,
         };
-        assert!(invalid.validate().is_err());
+        assert!(matches!(
+            invalid.validate().unwrap_err(),
+            ValidationError::InvalidVoiceId
+        ));
+    }
+
+    /// Regression guard for the Windows SAPI fix: registry-token voice ids
+    /// contain spaces and backslashes and must stay acceptable.
+    #[test]
+    fn test_native_voice_ids_with_spaces_and_backslashes_are_accepted() {
+        for id in [
+            r"HKEY_LOCAL_MACHINE\SOFTWARE\Microsoft\Speech\Voices\Tokens\TTS_MS_EN-US_ZIRA_11.0",
+            "Microsoft Zira Desktop",
+            "com.apple.voice.enhanced.pt-BR",
+        ] {
+            let request = PreviewVoiceRequest {
+                voice_id: id.to_string(),
+                text: None,
+            };
+            assert!(request.validate().is_ok(), "rejected {id}");
+        }
+    }
+
+    #[test]
+    fn test_validation_error_codes_are_specific() {
+        let cases = [
+            (ValidationError::EmptyText, "EMPTY_TEXT"),
+            (
+                ValidationError::TextTooLong { len: 1, max: 0 },
+                "TEXT_TOO_LONG",
+            ),
+            (
+                ValidationError::VoiceIdTooLong { len: 1, max: 0 },
+                "VOICE_ID_TOO_LONG",
+            ),
+            (ValidationError::InvalidVoiceId, "INVALID_VOICE_ID"),
+            (
+                ValidationError::LanguageTooLong { len: 1, max: 0 },
+                "LANGUAGE_TOO_LONG",
+            ),
+        ];
+        for (error, expected) in cases {
+            assert_eq!(error.code(), expected);
+        }
+    }
+
+    #[test]
+    fn test_language_too_long_is_rejected() {
+        let request = SpeakRequest {
+            text: "Hello".to_string(),
+            language: Some("x".repeat(MAX_LANGUAGE_LENGTH + 1)),
+            voice_id: None,
+            rate: 1.0,
+            pitch: 1.0,
+            volume: 1.0,
+            queue_mode: QueueMode::Flush,
+        };
+        assert!(matches!(
+            request.validate().unwrap_err(),
+            ValidationError::LanguageTooLong { .. }
+        ));
     }
 
     #[test]

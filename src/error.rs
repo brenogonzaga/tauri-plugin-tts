@@ -17,14 +17,8 @@ pub enum Error {
     #[error("TTS error: {0}")]
     Tts(#[from] tts::Error),
 
-    #[error("Failed to acquire lock on TTS engine")]
-    LockError,
-
     #[error("TTS engine mutex was poisoned - internal state may be corrupted")]
     MutexPoisoned,
-
-    #[error("TTS not initialized")]
-    NotInitialized,
 
     #[error("Validation error: {0}")]
     Validation(#[from] ValidationError),
@@ -41,10 +35,8 @@ impl Error {
             Error::PluginInvoke(_) => "PLUGIN_INVOKE_ERROR",
             #[cfg(desktop)]
             Error::Tts(_) => "TTS_ENGINE_ERROR",
-            Error::LockError => "LOCK_ERROR",
             Error::MutexPoisoned => "MUTEX_POISONED",
-            Error::NotInitialized => "NOT_INITIALIZED",
-            Error::Validation(_) => "VALIDATION_ERROR",
+            Error::Validation(e) => e.code(),
             Error::OperationFailed(_) => "OPERATION_FAILED",
         }
     }
@@ -61,5 +53,28 @@ impl Serialize for Error {
         state.serialize_field("code", self.code())?;
         state.serialize_field("message", &self.to_string())?;
         state.end()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validation_errors_keep_their_specific_code() {
+        let error = Error::from(ValidationError::EmptyText);
+        assert_eq!(error.code(), "EMPTY_TEXT");
+        assert_eq!(
+            Error::from(ValidationError::TextTooLong { len: 1, max: 0 }).code(),
+            "TEXT_TOO_LONG"
+        );
+    }
+
+    /// The JS side reads `{ code, message }` off the rejected invoke.
+    #[test]
+    fn serializes_as_code_and_message() {
+        let json = serde_json::to_value(Error::from(ValidationError::EmptyText)).unwrap();
+        assert_eq!(json["code"], "EMPTY_TEXT");
+        assert_eq!(json["message"], "Validation error: Text cannot be empty");
     }
 }

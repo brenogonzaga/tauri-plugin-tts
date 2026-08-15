@@ -8,6 +8,7 @@ const COMMANDS: &[&str] = &[
     "resume_speaking",
     "preview_voice",
     "register_listener",
+    "set_background_behavior",
 ];
 
 fn main() {
