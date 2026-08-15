@@ -5,6 +5,31 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.1.13] - 2026-08-15
+
+### Fixed
+
+- **Android**: Fixed `speech:finish` never being emitted when a `speak()` interrupted another.
+- **Android**: Fixed `pauseSpeaking()` returning `success: true` without pausing; speech kept playing through phone calls and through `setBackgroundBehavior({ continueInBackground: false })`.
+- **Android**: Fixed `queueMode: "add"` emitting `speech:start` before the queued utterance began.
+- **Android**: Fixed a flushed utterance releasing the audio focus of the one replacing it.
+- **Android**: Fixed `previewVoice()` inheriting rate and pitch from the previous `speak()` instead of using 1.0.
+- **Android**: Fixed `pitch` being clamped to a `0.1` floor instead of the `0.5` used elsewhere.
+- **Linux**: Fixed a missing speech-dispatcher aborting application startup; the plugin now loads degraded and `isInitialized()` reports `false`.
+- **iOS**: Fixed `speech:cancel` carrying the replacing utterance's ID, and the `speech:finish` that followed carrying none.
+- **Desktop**: Fixed `speech:cancel` carrying the ID of the utterance that was just starting.
+- **Android / iOS**: Fixed validation errors always arriving as `PLUGIN_INVOKE_ERROR`; typed codes such as `EMPTY_TEXT` now reach JavaScript.
+- **All platforms**: Fixed the 10,000 `text` limit counting bytes on desktop, UTF-16 units on Android and graphemes on iOS; it is UTF-8 bytes everywhere.
+- **All platforms**: Fixed `getVoices(language)` matching substrings, so `"BR"` returned `pt-BR` voices; it now matches by locale prefix, as `speak({ language })` already did.
+
+### Changed
+
+- **Android** (Breaking): `pauseSpeaking()` / `resumeSpeaking()` now return `{ success: false, reason }`, and `speech:pause` / `speech:resume` are no longer emitted. Interruptions stop the utterance and emit `speech:interrupted` or `speech:backgroundPause`.
+- **Android / iOS**: `rate`, `pitch` and `volume` are clamped once by the shared Rust validation instead of separately per platform.
+- **iOS**: Warns when `continueInBackground` is enabled but `UIBackgroundModes: audio` is missing from the Info.plist.
+- **Desktop**: `voiceId` and `language` limits count characters, not bytes.
+- Rewrote the README and corrected the documented Windows backend from SAPI to WinRT.
+
 ## [0.1.12] - 2026-08-15
 
 ### Fixed
