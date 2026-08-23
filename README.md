@@ -179,6 +179,10 @@ language and download Enhanced Quality.
 scale, but the engines themselves differ. Windows WinRT has coarse pitch control, and on Linux
 the result depends on the speech-dispatcher output module (espeak, festival, …).
 
+## Used By
+
+See [USED_BY.md](./USED_BY.md) for projects using this plugin in production.
+
 ## License
 
 MIT
