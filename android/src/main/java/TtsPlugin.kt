@@ -1,1134 +1,433 @@
-package io.affex.tts
+package com.tts
 
 import android.app.Activity
-import android.media.AudioAttributes
-import android.media.AudioFocusRequest
+import android.content.Context
 import android.media.AudioManager
-import android.os.Build
 import android.os.Bundle
+import android.os.Handler
+import android.os.Looper
 import android.speech.tts.TextToSpeech
 import android.speech.tts.UtteranceProgressListener
-import android.speech.tts.Voice
 import android.util.Log
 import app.tauri.annotation.Command
-import app.tauri.annotation.InvokeArg
 import app.tauri.annotation.TauriPlugin
-import app.tauri.plugin.Channel
+import app.tauri.plugin.Invoke
 import app.tauri.plugin.JSArray
 import app.tauri.plugin.JSObject
 import app.tauri.plugin.Plugin
-import app.tauri.plugin.Invoke
 import java.util.Locale
-import java.util.concurrent.ConcurrentLinkedQueue
 
-@InvokeArg
-class SpeakArgs {
-    var text: String = ""
-    var language: String? = null
-    var voiceId: String? = null
-    var rate: Float = 1.0f
-    var pitch: Float = 1.0f
-    var volume: Float = 1.0f
-    var queueMode: String = "flush"
-}
-
-@InvokeArg
-class GetVoicesArgs {
-    var language: String? = null
-}
-
-@InvokeArg
-class PreviewVoiceArgs {
-    var voiceId: String = ""
-    var text: String? = null
-    
-    fun sampleText(): String = text ?: "Hello! This is a sample of how this voice sounds."
-}
-
-@InvokeArg
-class SetBackgroundBehaviorArgs {
-    var continueInBackground: Boolean = true
-}
-
-@InvokeArg
-class SetupEventRelayArgs {
-    lateinit var channel: Channel
-}
-
-/** Maximum text length allowed (10KB) */
-private const val MAX_TEXT_LENGTH = 10_000
-
-/** Maximum voice ID length */
-private const val MAX_VOICE_ID_LENGTH = 256
-
-/** Maximum language code length */
-private const val MAX_LANGUAGE_LENGTH = 35
-
-/** Maximum pending requests in queue */
-private const val MAX_PENDING_REQUESTS = 50
-
-/** Timeout for pending requests in milliseconds */
-private const val PENDING_TIMEOUT_MS = 30_000L
-
-internal object InputValidator {
-    fun validateText(text: String): String? {
-        if (text.isEmpty()) return "Text cannot be empty"
-        val length = text.toByteArray(Charsets.UTF_8).size
-        if (length > MAX_TEXT_LENGTH) return "Text too long: $length bytes (max: $MAX_TEXT_LENGTH)"
-        return null
-    }
-    
-    fun validateVoiceId(voiceId: String): String? {
-        if (voiceId.length > MAX_VOICE_ID_LENGTH) return "Voice ID too long: ${voiceId.length} chars (max: $MAX_VOICE_ID_LENGTH)"
-        if (voiceId.any { it.isISOControl() }) return "Invalid voice ID - control characters are not allowed"
-        return null
-    }
-    
-    fun validateLanguage(language: String): String? {
-        if (language.length > MAX_LANGUAGE_LENGTH) return "Language code too long: ${language.length} chars (max: $MAX_LANGUAGE_LENGTH)"
-        return null
-    }
-}
-
-data class PendingSpeak(
-    val invoke: Invoke, 
-    val args: SpeakArgs,
-    val timestamp: Long = System.currentTimeMillis()
-)
-
-internal class EngineParams {
-    var rate = 1.0f
-        private set
-    var pitch = 1.0f
-        private set
-
-    /** True when the engine-global rate must be re-applied; records the new value. */
-    fun needsRate(value: Float): Boolean {
-        if (value == rate) return false
-        rate = value
-        return true
-    }
-
-    /** True when the engine-global pitch must be re-applied; records the new value. */
-    fun needsPitch(value: Float): Boolean {
-        if (value == pitch) return false
-        pitch = value
-        return true
-    }
-
-    /** A replacement TextToSpeech instance starts at its own defaults. */
-    fun reset() {
-        rate = 1.0f
-        pitch = 1.0f
-    }
-}
+private const val TAG = "TtsPlugin"
 
 @TauriPlugin
 class TtsPlugin(private val activity: Activity) : Plugin(activity), TextToSpeech.OnInitListener {
-    private var tts: TextToSpeech? = null
-    private var isInitialized = false
-    private var isForeground = true
-    private var continueInBackground = true
-    // Relay channel: forwards events to Rust app.emit() so JS listen() works on mobile.
-    private var eventChannel: Channel? = null
-    private val pendingRequests = ConcurrentLinkedQueue<PendingSpeak>()
-    private var audioManager: AudioManager? = null
-    private var audioFocusRequest: AudioFocusRequest? = null
-    private var cachedVoices: Set<Voice>? = null
-    private var lastVoiceId: String? = null
-    private val engineParams = EngineParams()
-    @Volatile private var lastUtteranceId: String? = null
-    // The utterance whose speech:start / terminal event has already gone out. Shared between
-    // UtteranceProgressListener (background thread) and polling (main thread); @Volatile gives
-    // cross-thread visibility and the check-then-set pattern deduplicates events.
-    //
-    // Keyed by utterance id rather than a plain Boolean: under QUEUE_FLUSH the outgoing
-    // utterance's onStop() fires *after* its replacement was queued, so a global "finished"
-    // flag got consumed by the utterance being cancelled and permanently swallowed the
-    // speech:finish of the one that replaced it.
-    @Volatile private var startedId: String? = null
-    @Volatile private var finishedId: String? = null
 
+    private var engine: TextToSpeech? = null
+    private val events = SpeechEventRelay()
+    private val poller = ProgressPoller()
+    private val pending = PendingRequests { delay, action ->
+        Handler(Looper.getMainLooper()).postDelayed(action, delay)
+    }
 
-    private val audioFocusChangeListener = AudioManager.OnAudioFocusChangeListener { focusChange ->
-        when (focusChange) {
-            AudioManager.AUDIOFOCUS_LOSS -> {
-                // Permanent loss - another app took focus
-                Log.d(TAG, "Audio focus LOST permanently")
-                tts?.stop()
-                emitEvent("speech:interrupted", reason = "audio_focus_lost")
-            }
-            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT -> {
-                // Temporary loss - e.g., phone call. Android TTS has no pause, so the only way
-                // to actually stop talking over the interruption is to stop the utterance.
-                Log.d(TAG, "Audio focus LOST transiently (phone call, notification, etc.)")
-                if (tts?.isSpeaking == true) {
-                    tts?.stop()
-                    emitEvent("speech:interrupted", reason = "audio_focus_transient_loss")
-                }
-            }
-            AudioManager.AUDIOFOCUS_LOSS_TRANSIENT_CAN_DUCK -> {
-                // We could lower volume, but for TTS it's better to stop
-                Log.d(TAG, "Audio focus LOSS_TRANSIENT_CAN_DUCK - stopping speech")
-                if (tts?.isSpeaking == true) {
-                    tts?.stop()
-                    emitEvent("speech:interrupted", reason = "audio_focus_duck")
-                }
-            }
-            AudioManager.AUDIOFOCUS_GAIN -> {
-                // Nothing to resume: the interrupted utterance was stopped, and Android
-                // offers no way to restart it from where it left off.
-                Log.d(TAG, "Audio focus GAINED")
-            }
+    private val focus = AudioFocusController(
+        activity.getSystemService(Context.AUDIO_SERVICE) as? AudioManager,
+    ) { _, reason ->
+        // Android TTS cannot pause, so stopping is the only way to yield the audio.
+        if (engine?.isSpeaking == true) {
+            engine?.stop()
+            events.emit(SpeechEvent.INTERRUPTED, reason = reason)
         }
     }
 
-    companion object {
-        private const val TAG = "TtsPlugin"
-    }
+    @Volatile private var ready = false
+
+    /** `onInit` fires once per engine; after a failure there is no second chance. */
+    @Volatile private var initFailed = false
+
+    private var continueInBackground = true
+    private var currentUtteranceId: String? = null
+    private var cachedVoices: List<VoiceInfo> = emptyList()
 
     init {
-        Log.d(TAG, "TtsPlugin INIT")
-        Log.d(TAG, "  Package: ${activity.packageName}")
-        Log.d(TAG, "  Android SDK: ${Build.VERSION.SDK_INT}")
-        Log.d(TAG, "  Creating TextToSpeech engine...")
-        tts = TextToSpeech(activity, this)
-        audioManager = activity.getSystemService(android.content.Context.AUDIO_SERVICE) as? AudioManager
-        Log.d(TAG, "  AudioManager initialized: ${audioManager != null}")
+        engine = TextToSpeech(activity, this)
     }
 
     override fun onInit(status: Int) {
-        Log.d(TAG, "TTS onInit() CALLED")
-        Log.d(TAG, "  Status: $status (SUCCESS=${TextToSpeech.SUCCESS}, ERROR=${TextToSpeech.ERROR})")
-        
-        if (status == TextToSpeech.SUCCESS) {
-            isInitialized = true
-            Log.i(TAG, "  TTS initialized successfully")
-            
-            tts?.let { engine ->
-                val defaultVoice = engine.defaultVoice
-                Log.d(TAG, "  Default voice: ${defaultVoice?.name ?: "null"}")
-                Log.d(TAG, "  Default language: ${engine.defaultVoice?.locale?.toLanguageTag() ?: "unknown"}")
-                Log.d(TAG, "  Available voices: ${engine.voices?.size ?: 0}")
-            }
-            
-            // Setup utterance progress listener for speech events
-            setupUtteranceProgressListener()
-            
-            // Process all pending requests (with timeout check)
-            val pendingCount = pendingRequests.size
-            Log.d(TAG, "  Processing $pendingCount pending requests")
-            processPendingRequests()
-        } else {
-            Log.e(TAG, "  TTS initialization FAILED with status: $status")
-            // Reject all pending requests
-            while (pendingRequests.isNotEmpty()) {
-                val pending = pendingRequests.poll()
-                pending?.invoke?.reject("TTS initialization failed")
-            }
+        if (status != TextToSpeech.SUCCESS) {
+            Log.e(TAG, "TTS initialization failed with status $status")
+            initFailed = true
+            pending.rejectAll(INIT_FAILED_MESSAGE)
+            return
+        }
+
+        ready = true
+        initFailed = false
+        engine?.setOnUtteranceProgressListener(progressListener)
+        refreshVoiceCache()
+        pending.drain { startSpeaking(it.invoke, it.args) }
+    }
+
+    private val progressListener = object : UtteranceProgressListener() {
+        override fun onStart(utteranceId: String?) {
+            events.start(utteranceId)
+        }
+
+        override fun onDone(utteranceId: String?) {
+            finished(utteranceId, SpeechEvent.FINISH)
+        }
+
+        @Deprecated("Superseded by onError(String, Int)")
+        override fun onError(utteranceId: String?) {
+            finished(utteranceId, SpeechEvent.ERROR, error = "Speech synthesis error")
+        }
+
+        override fun onError(utteranceId: String?, errorCode: Int) {
+            finished(utteranceId, SpeechEvent.ERROR, error = describe(errorCode))
+        }
+
+        override fun onStop(utteranceId: String?, interrupted: Boolean) {
+            finished(utteranceId, SpeechEvent.CANCEL, interrupted = interrupted)
         }
     }
-    
-    private fun processPendingRequests() {
-        val now = System.currentTimeMillis()
-        while (pendingRequests.isNotEmpty()) {
-            val pending = pendingRequests.poll() ?: break
-            if (now - pending.timestamp > PENDING_TIMEOUT_MS) {
-                Log.w(TAG, "  Pending request timed out after ${now - pending.timestamp}ms")
-                pending.invoke.reject("Request timed out while waiting for TTS initialization")
-            } else {
-                executeSpeakInternal(pending.invoke, pending.args)
-            }
-        }
-    }
-    
-    private fun setupUtteranceProgressListener() {
-        Log.d(TAG, "setupUtteranceProgressListener() CALLED")
-        tts?.setOnUtteranceProgressListener(object : UtteranceProgressListener() {
-            override fun onStart(utteranceId: String?) {
-                Log.d(TAG, "✓ UtteranceProgressListener.onStart() CALLED: $utteranceId")
-                emitStartOnce(utteranceId)
-            }
 
-            override fun onDone(utteranceId: String?) {
-                Log.d(TAG, "✓ UtteranceProgressListener.onDone() CALLED: $utteranceId")
-                emitFinishOnce(utteranceId, "speech:finish")
-            }
-
-            @Deprecated("Deprecated in API level 21")
-            override fun onError(utteranceId: String?) {
-                Log.e(TAG, "✗ UtteranceProgressListener.onError() CALLED: $utteranceId")
-                emitFinishOnce(utteranceId, "speech:error", error = "Speech synthesis error")
-            }
-
-            override fun onError(utteranceId: String?, errorCode: Int) {
-                Log.e(TAG, "✗ UtteranceProgressListener.onError() CALLED: $utteranceId, code: $errorCode")
-                emitFinishOnce(utteranceId, "speech:error", error = getErrorMessage(errorCode))
-            }
-
-            override fun onStop(utteranceId: String?, interrupted: Boolean) {
-                Log.d(TAG, "✓ UtteranceProgressListener.onStop() CALLED: $utteranceId, interrupted: $interrupted")
-                emitFinishOnce(utteranceId, "speech:cancel", interrupted = interrupted)
-            }
-        })
-        Log.d(TAG, "  ✓ UtteranceProgressListener registered successfully")
-    }
-
-    // Emits speech:start at most once for [utteranceId].
-    private fun emitStartOnce(utteranceId: String?) {
-        val id = utteranceId ?: return
-        if (id == startedId) return
-        startedId = id
-        emitEvent("speech:start", id = id)
-    }
-
-    // Emits a terminal event (finish / cancel / error) at most once for [utteranceId].
-    private fun emitFinishOnce(
+    private fun finished(
         utteranceId: String?,
         eventType: String,
         error: String? = null,
-        interrupted: Boolean? = null
+        interrupted: Boolean? = null,
     ) {
-        val id = utteranceId ?: return
-        if (id == finishedId) return
-        finishedId = id
-        emitEvent(eventType, id = id, error = error, interrupted = interrupted)
-        if (id == lastUtteranceId) releaseAudioFocus()
-    }
-    
-    private fun requestAudioFocus(): Boolean {
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            // AUDIOFOCUS_GAIN_TRANSIENT: correct type for TTS/navigation speech.
-            // The Google TTS engine runs as a separate service and also requests audio focus
-            // internally to play back synthesized audio. Using AUDIOFOCUS_GAIN (permanent)
-            // causes a conflict: when the TTS service requests its own focus, the system sends
-            // AUDIOFOCUS_LOSS to our listener which then calls tts.stop() — producing silence.
-            // AUDIOFOCUS_GAIN_TRANSIENT avoids this conflict.
-            val focusRequest = AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
-                .setAudioAttributes(
-                    AudioAttributes.Builder()
-                        .setUsage(AudioAttributes.USAGE_ASSISTANT)
-                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                        .build()
-                )
-                .setOnAudioFocusChangeListener(audioFocusChangeListener)
-                .build()
-            audioFocusRequest = focusRequest
-            audioManager?.requestAudioFocus(focusRequest) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
-        } else {
-            @Suppress("DEPRECATION")
-            audioManager?.requestAudioFocus(
-                audioFocusChangeListener,
-                AudioManager.STREAM_MUSIC,
-                AudioManager.AUDIOFOCUS_GAIN_TRANSIENT
-            ) == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
-        }
-    }
-    
-    private fun releaseAudioFocus() {
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-            audioFocusRequest?.let { audioManager?.abandonAudioFocusRequest(it) }
-        } else {
-            @Suppress("DEPRECATION")
-            audioManager?.abandonAudioFocus(audioFocusChangeListener)
-        }
+        events.finish(utteranceId, eventType, error, interrupted)
+        if (utteranceId == currentUtteranceId) focus.release()
     }
 
-    // Reinitialize the TTS engine from scratch.
-    private fun reinitializeTts() {
-        Log.w(TAG, "reinitializeTts() - engine in bad state, restarting")
-        releaseAudioFocus()
-        tts?.stop()
-        tts?.shutdown()
-        tts = null
-        isInitialized = false
-        cachedVoices = null
-        lastVoiceId = null
-        startedId = null
-        finishedId = null
-        engineParams.reset()
-        Log.d(TAG, "reinitializeTts() - creating new TextToSpeech instance...")
-        tts = TextToSpeech(activity, this)
+    override fun onPause() {
+        super.onPause()
+        if (continueInBackground || engine?.isSpeaking != true) return
+
+        // Android cannot pause, so stop; the listener reports the resulting cancel.
+        engine?.stop()
+        events.emit(SpeechEvent.BACKGROUND_PAUSE, reason = "app_paused")
     }
-    
-    private fun getErrorMessage(errorCode: Int): String {
-        return when (errorCode) {
-            TextToSpeech.ERROR -> "Generic error"
-            TextToSpeech.ERROR_INVALID_REQUEST -> "Invalid request"
-            TextToSpeech.ERROR_NETWORK -> "Network error"
-            TextToSpeech.ERROR_NETWORK_TIMEOUT -> "Network timeout"
-            TextToSpeech.ERROR_NOT_INSTALLED_YET -> "TTS not installed"
-            TextToSpeech.ERROR_OUTPUT -> "Output error"
-            TextToSpeech.ERROR_SERVICE -> "Service error"
-            TextToSpeech.ERROR_SYNTHESIS -> "Synthesis error"
-            else -> "Unknown error ($errorCode)"
-        }
+
+    override fun onDestroy(activity: androidx.appcompat.app.AppCompatActivity) {
+        super.onDestroy(activity)
+        focus.release()
+        engine?.stop()
+        engine?.shutdown()
+        engine = null
+        ready = false
+    }
+
+    /** Recreates the engine after it reports a state it cannot recover from. */
+    private fun restart() {
+        Log.w(TAG, "restarting the TTS engine")
+        focus.release()
+        engine?.stop()
+        engine?.shutdown()
+        ready = false
+        initFailed = false
+        cachedVoices = emptyList()
+        events.reset()
+        engine = TextToSpeech(activity, this)
     }
 
     @Command
     fun speak(invoke: Invoke) {
-        Log.i(TAG, "speak() CALLED")
         val args = invoke.parseArgs(SpeakArgs::class.java)
-        
-        InputValidator.validateText(args.text)?.let { error ->
-            invoke.reject(error)
-            return
-        }
-        args.voiceId?.let { voiceId ->
-            InputValidator.validateVoiceId(voiceId)?.let { error ->
-                invoke.reject(error)
-                return
-            }
-        }
-        args.language?.let { language ->
-            InputValidator.validateLanguage(language)?.let { error ->
-                invoke.reject(error)
-                return
-            }
-        }
-        
-        Log.d(TAG, "  Text: \"${args.text.take(50)}${if (args.text.length > 50) "..." else ""}\"")
-        Log.d(TAG, "  Language: ${args.language ?: "(null -> system default)"}")
-        Log.d(TAG, "  VoiceId: ${args.voiceId ?: "(null -> system default)"}")
-        Log.d(TAG, "  Rate: ${args.rate}, Pitch: ${args.pitch}, Volume: ${args.volume}")
-        Log.d(TAG, "  QueueMode: ${args.queueMode}")
-        
-        audioManager?.let { am ->
-            Log.d(TAG, "  Media volume: ${am.getStreamVolume(AudioManager.STREAM_MUSIC)}/${am.getStreamMaxVolume(AudioManager.STREAM_MUSIC)}")
-        }
-        Log.d(TAG, "  TTS initialized: $isInitialized, Foreground: $isForeground")
-        
-        if (!isInitialized) {
-            if (pendingRequests.size >= MAX_PENDING_REQUESTS) {
-                Log.e(TAG, "  Too many pending requests (${pendingRequests.size})")
+        args.validate()?.let { return invoke.reject(it) }
+
+        if (initFailed) return invoke.reject(INIT_FAILED_MESSAGE)
+
+        if (!ready) {
+            if (!pending.add(invoke, args)) {
                 invoke.reject("Too many pending requests - TTS may have failed to initialize")
-                return
             }
-            Log.w(TAG, "  TTS not initialized, queuing request (queue size: ${pendingRequests.size})")
-            pendingRequests.add(PendingSpeak(invoke, args))
             return
         }
-        
-        executeSpeakInternal(invoke, args)
-    }
-    
-    private fun executeSpeakInternal(invoke: Invoke, args: SpeakArgs) {
-        Log.d(TAG, "executeSpeakInternal() called")
-        try {
-            tts?.let { engine ->
-                // Request audio focus before speaking
-                val hasFocus = requestAudioFocus()
-                Log.d(TAG, "  Audio focus requested: $hasFocus")
-                
-                var warning: String? = null
-                
-                // Treat "default" as no voice selection (use system default)
-                val voiceId = args.voiceId?.takeIf { it != "default" && it.isNotBlank() }
-                
-                voiceId?.let { id ->
-                    Log.d(TAG, "  Looking for voice: $id")
-                    var voices = engine.voices
-                    
-                    // If voices are null, try aggressive refresh strategies
-                    if (voices == null || voices.isEmpty()) {
-                        Log.w(TAG, "  Initial voices query returned null/empty, attempting aggressive refresh...")
-                        
-                        // Strategy 1: Access current voice
-                        val currentVoice = engine.voice
-                        Log.d(TAG, "  Strategy 1 - Current voice: ${currentVoice?.name ?: "null"}")
-                        voices = engine.voices
-                        
-                        // Strategy 2: Access default voice if still null
-                        if (voices == null || voices.isEmpty()) {
-                            try {
-                                val defaultVoice = engine.defaultVoice
-                                Log.d(TAG, "  Strategy 2 - Default voice: ${defaultVoice?.name ?: "null"}")
-                                voices = engine.voices
-                            } catch (e: Exception) {
-                                Log.w(TAG, "  Strategy 2 failed: ${e.message}")
-                            }
-                        }
-                        
-                        // Strategy 3: Try to reset language to force engine refresh
-                        if (voices == null || voices.isEmpty()) {
-                            try {
-                                val currentLocale = engine.language
-                                Log.d(TAG, "  Strategy 3 - Resetting language: $currentLocale")
-                                engine.setLanguage(currentLocale)
-                                voices = engine.voices
-                            } catch (e: Exception) {
-                                Log.w(TAG, "  Strategy 3 failed: ${e.message}")
-                            }
-                        }
-                        
-                        // Strategy 4: fall back to the cache populated by getVoices()
-                        if (voices == null || voices.isEmpty()) {
-                            val cached = cachedVoices
-                            if (cached != null && cached.isNotEmpty()) {
-                                Log.i(TAG, "  ✓ Strategy 4 - Using cachedVoices: ${cached.size} voices")
-                                voices = cached
-                            } else {
-                                // Engine truly broken AND no cache — reinitialize and retry.
-                                Log.w(TAG, "  Engine in bad state (voices=null, no cache). Queuing and reinitializing...")
-                                if (pendingRequests.size < MAX_PENDING_REQUESTS) {
-                                    pendingRequests.add(PendingSpeak(invoke, args))
-                                } else {
-                                    invoke.reject("TTS engine is temporarily unavailable. Please try again in a moment.")
-                                }
-                                reinitializeTts()
-                                return
-                            }
-                        } else {
-                            Log.i(TAG, "  ✓ Voices refreshed successfully! Now have ${voices.size} voices")
-                        }
-                    }
 
-                    when {
-                        else -> {
-                            // Voices available - can set new voice
-                            cachedVoices = voices
-                            Log.d(TAG, "  Available voices count: ${voices.size} (cache updated)")
-                            
-                            val selectedVoice = voices.find { it.name == id }
-                            if (selectedVoice != null) {
-                                // Check if voice is actually usable
-                                val isNetworkRequired = selectedVoice.isNetworkConnectionRequired
-                                val quality = selectedVoice.quality
-                                val voiceLocale = selectedVoice.locale
-                                
-                                Log.d(TAG, "  Voice details: name=${selectedVoice.name}, network=$isNetworkRequired, quality=$quality")
-                                Log.d(TAG, "  Voice locale: ${voiceLocale.toLanguageTag()}")
-                                
-                                // Check if the voice's language data is available on the device
-                                val langAvailability = engine.isLanguageAvailable(voiceLocale)
-                                Log.d(TAG, "  Language availability: $langAvailability (AVAILABLE=0, MISSING_DATA=-1, NOT_SUPPORTED=-2)")
-                                
-                                // For local voices, check if language data is actually present
-                                if (!isNetworkRequired && langAvailability == TextToSpeech.LANG_MISSING_DATA) {
-                                    Log.e(TAG, "  ✗ Local voice missing data: ${selectedVoice.name}")
-                                    invoke.reject("Voice '${selectedVoice.name}' requires language data that is not installed. This voice should have been filtered from the list.")
-                                    return
-                                }
-                                
-                                // Try to set the voice
-                                try {
-                                    engine.voice = selectedVoice
-                                    
-                                    // Verify voice was actually set
-                                    val verifyVoice = engine.voice
-                                    if (verifyVoice?.name != selectedVoice.name) {
-                                        Log.e(TAG, "  ✗ Failed to set voice - engine rejected it")
-                                        Log.e(TAG, "  Requested: ${selectedVoice.name}, Got: ${verifyVoice?.name}")
-                                        invoke.reject("Failed to set voice '${selectedVoice.name}' - TTS engine rejected the voice configuration.")
-                                        return
-                                    }
-                                    
-                                    lastVoiceId = id
-                                    Log.d(TAG, "  ✓ Voice set successfully: ${selectedVoice.name}")
-                                } catch (e: Exception) {
-                                    Log.e(TAG, "  ✗ Exception setting voice: ${e.message}", e)
-                                    invoke.reject("Failed to set voice: ${e.message}")
-                                    return
-                                }
-                            } else {
-                                // Try fallback
-                                val voiceParts = id.split("-")
-                                val languagePrefix = if (voiceParts.size >= 2) "${voiceParts[0]}-${voiceParts[1]}" else voiceParts[0]
-                                
-                                val fallbackVoice = voices
-                                    .filter { it.locale.toLanguageTag().lowercase().startsWith(languagePrefix.lowercase()) }
-                                    .filter { !it.isNetworkConnectionRequired }
-                                    .firstOrNull()
-                                
-                                if (fallbackVoice != null) {
-                                    engine.voice = fallbackVoice
-                                    lastVoiceId = fallbackVoice.name
-                                    Log.w(TAG, "  Voice not found: $id, using fallback: ${fallbackVoice.name}")
-                                    warning = "Voice '$id' not available, using '${fallbackVoice.name}' instead"
-                                } else {
-                                    Log.w(TAG, "  Voice not found: $id, using default")
-                                    warning = "Voice '$id' not found, using default voice"
-                                }
-                            }
-                        }
-                    }
-                } ?: run {
-                    // No specific voice requested - try to set language if provided
-                    val language = args.language?.takeIf { it != "default" && it.isNotBlank() }
-                    language?.let { lang ->
-                        Log.d(TAG, "  Setting language: $lang")
-                        val locale = parseLocale(lang)
-                        val result = engine.setLanguage(locale)
-                        Log.d(TAG, "  setLanguage result: $result")
-                        if (result == TextToSpeech.LANG_MISSING_DATA || result == TextToSpeech.LANG_NOT_SUPPORTED) {
-                            Log.w(TAG, "  Language not supported: $lang, using default")
-                            warning = "Language '$lang' not supported, using default language"
-                        }
-                    } ?: run {
-                        Log.d(TAG, "  Using system default voice")
-                        val currentVoice = engine.voice
-                        val currentLanguage = engine.language
-                        Log.d(TAG, "  Current voice: ${currentVoice?.name ?: "null"}")
-                        Log.d(TAG, "  Current language: ${currentLanguage?.toLanguageTag() ?: "unknown"}")
-                        
-                        // If no voice is set, try to set a default one
-                        if (currentVoice == null) {
-                            Log.w(TAG, "  No voice is currently set, attempting to set default")
-                            val voices = (engine.voices?.takeIf { it.isNotEmpty() } ?: cachedVoices)
-                            if (voices != null && voices.isNotEmpty()) {
-                                // Find first local (non-network) voice
-                                val defaultVoice = voices
-                                    .filter { !it.isNetworkConnectionRequired }
-                                    .minByOrNull { it.locale.toLanguageTag() }
-                                
-                                if (defaultVoice != null) {
-                                    engine.voice = defaultVoice
-                                    Log.d(TAG, "  Set default voice: ${defaultVoice.name}")
-                                } else {
-                                    Log.w(TAG, "  No local voices available, using engine default")
-                                }
-                            } else {
-                                // Engine has no voice and no cache — reinitialize and retry
-                                Log.w(TAG, "  No voices available from engine or cache. Queuing and reinitializing...")
-                                if (pendingRequests.size < MAX_PENDING_REQUESTS) {
-                                    pendingRequests.add(PendingSpeak(invoke, args))
-                                } else {
-                                    invoke.reject("TTS engine is temporarily unavailable. Please try again in a moment.")
-                                }
-                                reinitializeTts()
-                                return
-                            }
-                        }
-                    }
-                }
-
-                // Android TTS: 1.0 is normal speed, 0.5 is half, 2.0 is double
-                // Match user API directly (no normalization needed)
-                val rate = args.rate.coerceIn(0.1f, 4.0f)
-                val pitch = args.pitch.coerceIn(0.5f, 2.0f)
-                val volume = args.volume.coerceIn(0.0f, 1.0f)
-                
-                // See EngineParams: only re-apply what actually changed, but do
-                // re-apply a return to 1.0 — these setters are engine-global.
-                if (engineParams.needsRate(rate)) {
-                    engine.setSpeechRate(rate)
-                    Log.d(TAG, "  Rate set to: $rate")
-                } else {
-                    Log.d(TAG, "  Rate: $rate (already applied)")
-                }
-
-                if (engineParams.needsPitch(pitch)) {
-                    engine.setPitch(pitch)
-                    Log.d(TAG, "  Pitch set to: $pitch")
-                } else {
-                    Log.d(TAG, "  Pitch: $pitch (already applied)")
-                }
-
-                Log.d(TAG, "  Volume: $volume (per-utterance, via Bundle)")
-
-                val utteranceId = "tts_${System.currentTimeMillis()}"
-                
-                Log.d(TAG, "  Utterance ID: $utteranceId")
-                lastUtteranceId = utteranceId
-
-                // Determine queue mode: QUEUE_FLUSH (default) or QUEUE_ADD
-                val queueMode = if (args.queueMode.lowercase() == "add") {
-                    Log.d(TAG, "  Queue mode: QUEUE_ADD")
-                    TextToSpeech.QUEUE_ADD
-                } else {
-                    Log.d(TAG, "  Queue mode: QUEUE_FLUSH")
-                    TextToSpeech.QUEUE_FLUSH
-                }
-                
-                // Verify engine state before speak
-                Log.d(TAG, "  About to call engine.speak()...")
-                Log.d(TAG, "    Engine default voice: ${engine.defaultVoice?.name}")
-                Log.d(TAG, "    Engine voices available: ${engine.voices?.size ?: 0}")
-                
-                // Use modern Bundle API (API 21+) — the deprecated HashMap API does not reliably
-                // trigger UtteranceProgressListener callbacks on some voices/engines.
-                // Pass volume in the Bundle (rate/pitch are set directly on the engine).
-                val params = if (volume != 1.0f) {
-                    Bundle().apply { putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, volume) }
-                } else null
-                val speakResult = engine.speak(args.text, queueMode, params, utteranceId)
-                Log.d(TAG, "  speak() result: $speakResult (SUCCESS=${TextToSpeech.SUCCESS}, ERROR=${TextToSpeech.ERROR})")
-                
-                // Log final engine state after speak attempt
-                val voiceAfterSpeak = engine.voice
-                Log.d(TAG, "  Engine voice after speak: ${voiceAfterSpeak?.name ?: "null"}")
-                Log.d(TAG, "  Engine language: ${voiceAfterSpeak?.locale?.toLanguageTag() ?: engine.language?.toLanguageTag() ?: "unknown"}")
-                Log.d(TAG, "  Is speaking (immediate): ${engine.isSpeaking}")
-                
-                // Check if speak() was successful
-                if (speakResult != TextToSpeech.SUCCESS) {
-                    Log.e(TAG, "  speak() returned ERROR!")
-                    
-                    // Provide context based on what we know
-                    val errorMsg = when {
-                        voiceAfterSpeak == null && warning?.contains("temporarily unavailable") == true -> {
-                            // Voice was temporarily unavailable and speak() failed
-                            Log.e(TAG, "  Engine couldn't speak - voice configuration was lost")
-                            "TTS engine temporarily lost voice configuration. Please try again in a moment or select a different voice."
-                        }
-                        voiceAfterSpeak == null -> {
-                            // Voice is null but we didn't expect it
-                            Log.e(TAG, "  ENGINE STATE CORRUPTED: voice is null unexpectedly")
-                            "TTS engine lost voice configuration. Please try again or restart the app."
-                        }
-                        warning?.contains("temporarily unavailable") == true -> {
-                            // Voice was unavailable but speak still failed
-                            Log.e(TAG, "  Engine has voice but failed to speak - may need reinitialization")
-                            "TTS engine is temporarily unavailable. Please try again in a moment."
-                        }
-                        else -> {
-                            // Unknown error
-                            Log.e(TAG, "  Unexpected speak() failure with voice: ${voiceAfterSpeak.name}")
-                            "Failed to start speaking. Please try again."
-                        }
-                    }
-                    
-                    invoke.reject(errorMsg)
-                    return
-                }
-                
-                Log.d(TAG, "  Text to speak: \"${args.text.take(50)}${if (args.text.length > 50) "..." else ""}\"")
-                Log.d(TAG, "  Text length: ${args.text.length} characters")
-                
-                // Polling fallback: emit speech:start / speech:finish by watching isSpeaking when
-                // UtteranceProgressListener doesn't fire (known issue with Google TTS on emulators).
-                // Goes through the same emitStartOnce/emitFinishOnce guards as the listener, so
-                // exactly one path wins each event even if both fire around the same time.
-                //
-                // On Android 14+ (API 34+), isSpeaking() returns false as soon as synthesis is
-                // handed to the hardware audio buffer — BEFORE playback actually completes. A naive
-                // !speaking check would then fire speech:finish prematurely for long texts, causing
-                // the caller to stop or replace audio that is still playing.
-                // Fix: debounce finish detection by requiring FINISH_DEBOUNCE_POLLS consecutive
-                // not-speaking readings before concluding that speech is truly over.
-                //
-                // Only runs for QUEUE_FLUSH: isSpeaking cannot say *which* utterance is
-                // speaking, so under QUEUE_ADD it reports the predecessor still playing and
-                // would emit speech:start for an utterance that has not begun. Queued
-                // utterances rely on the listener alone.
-                val pollStartTime = System.currentTimeMillis()
-                val FINISH_DEBOUNCE_POLLS = 15  // 15 × 100ms = 1.5 s of confirmed silence
-
-                if (queueMode == TextToSpeech.QUEUE_FLUSH) activity.runOnUiThread {
-                    val handler = android.os.Handler(android.os.Looper.getMainLooper())
-                    var notSpeakingStreak = 0
-                    val poll = object : Runnable {
-                        override fun run() {
-                            if (utteranceId != lastUtteranceId) return  // superseded by newer speak()
-                            if (utteranceId == finishedId) return         // already done
-
-                            val speaking = engine.isSpeaking
-                            val elapsed = System.currentTimeMillis() - pollStartTime
-
-                            if (utteranceId != startedId && speaking) {
-                                Log.d(TAG, "Polling: speech:start for $utteranceId (+${elapsed}ms)")
-                                emitStartOnce(utteranceId)
-                            }
-
-                            if (utteranceId == startedId) {
-                                if (!speaking) {
-                                    notSpeakingStreak++
-                                    if (notSpeakingStreak >= FINISH_DEBOUNCE_POLLS) {
-                                        Log.d(TAG, "Polling: speech:finish for $utteranceId (+${elapsed}ms, ${notSpeakingStreak} quiet polls)")
-                                        emitFinishOnce(utteranceId, "speech:finish")
-                                        return
-                                    }
-                                } else {
-                                    notSpeakingStreak = 0  // transient false — reset streak
-                                }
-                            } else if (elapsed > 10_000L) {
-                                Log.e(TAG, "⚠️ Polling timeout: speech never started for $utteranceId")
-                                emitFinishOnce(
-                                    utteranceId,
-                                    "speech:error",
-                                    error = "TTS engine did not start speaking after 10 seconds"
-                                )
-                                return
-                            }
-
-                            handler.postDelayed(this, 100)
-                        }
-                    }
-                    handler.postDelayed(poll, 100)
-                }
-
-                val ret = JSObject()
-                ret.put("success", true)
-                ret.put("utteranceId", utteranceId)
-                warning?.let { ret.put("warning", it) }
-                invoke.resolve(ret)
-            } ?: run {
-                invoke.reject("TTS not initialized")
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Error speaking: ${e.message}")
-            invoke.reject("Failed to speak: ${e.message}")
-        }
+        startSpeaking(invoke, args)
     }
 
     @Command
     fun stop(invoke: Invoke) {
-        Log.i(TAG, "stop() CALLED")
-        try {
-            tts?.stop()
-            Log.d(TAG, "  TTS stopped")
-            val ret = JSObject()
-            ret.put("success", true)
-            invoke.resolve(ret)
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to stop: ${e.message}", e)
-            invoke.reject("Failed to stop: ${e.message}")
-        }
+        engine?.stop()
+        focus.release()
+        invoke.resolve(JSObject().put("success", true))
     }
 
     @Command
     fun getVoices(invoke: Invoke) {
-        Log.i(TAG, "getVoices() CALLED")
         val args = invoke.parseArgs(GetVoicesArgs::class.java)
-        Log.d(TAG, "  Language filter: ${args.language ?: "none"}")
-        
-        if (!isInitialized) {
-            Log.w(TAG, "  TTS not initialized, returning empty list")
-            // Return empty list instead of rejecting - allows UI to show loading state
-            val ret = JSObject()
-            ret.put("voices", JSArray())
-            ret.put("initialized", false)
-            invoke.resolve(ret)
-            return
+
+        // An empty list rather than a rejection: the UI can show a loading state and poll
+        // isInitialized() instead of having to treat "not ready yet" as an error.
+        val voices = if (ready) refreshVoiceCache() else emptyList()
+
+        val array = JSArray()
+        for (voice in VoiceCatalog.listable(voices, args.language)) {
+            array.put(
+                JSObject()
+                    .put("id", voice.id)
+                    .put("name", voice.displayName())
+                    .put("language", voice.languageTag)
+            )
         }
 
-        try {
-            var voices = tts?.voices
-            
-            // If voices is null/empty, try cache
-            if (voices == null || voices.isEmpty()) {
-                Log.w(TAG, "  TTS voices unavailable, using cache")
-                voices = cachedVoices ?: emptySet()
-            } else {
-                // Update cache
-                cachedVoices = voices
-            }
-            
-            Log.d(TAG, "  Total voices available: ${voices.size}")
-            
-            // Filter out voices with missing data (not installed)
-            // Problem: isLanguageAvailable() only checks language, not voice-specific data
-            // Solution: Use stricter quality threshold (400+) and check features
-            val engine = tts // Local reference for filtering
-            val installedVoices = if (engine != null) {
-                voices.filter { voice ->
-                    val features = voice.features
-
-                    // Network voices: include all — they work with internet connection
-                    if (voice.isNetworkConnectionRequired) {
-                        return@filter true
-                    }
-
-                    // --- Local voice filtering ---
-
-                    // 1. Language must be available on device
-                    val langAvailability = engine.isLanguageAvailable(voice.locale)
-                    if (langAvailability < TextToSpeech.LANG_AVAILABLE) {
-                        Log.d(TAG, "  Filtering out local voice (language unavailable): ${voice.name}")
-                        return@filter false
-                    }
-
-                    // 2. Must NOT be flagged as not installed (produces garbled/no audio)
-                    //    Feature flag lives on TextToSpeech.Engine, not Voice
-                    if (features?.contains(TextToSpeech.Engine.KEY_FEATURE_NOT_INSTALLED) == true) {
-                        Log.d(TAG, "  Filtering out local voice (not installed, features: $features): ${voice.name}")
-                        return@filter false
-                    }
-
-                    // 3. Filter out Google TTS "-language" routing stubs (e.g. "en-US-language").
-                    //    These appear as local + quality=400 but speak() silently fails with no
-                    //    callbacks when the language pack is not downloaded.
-                    if (voice.name.endsWith("-language")) {
-                        Log.d(TAG, "  Filtering out language-routing stub: ${voice.name}")
-                        return@filter false
-                    }
-
-                    true
-                }
-            } else {
-                voices // If engine is null, return all voices (shouldn't happen)
-            }
-            
-            Log.d(TAG, "  Installed/network voices: ${installedVoices.size}")
-            
-            val voicesArray = JSArray()
-            
-            // Track unique voice IDs to avoid duplicates
-            val seenIds = mutableSetOf<String>()
-            
-            // Sort: local first, then by language, then by name
-            installedVoices.sortedWith(
-                compareBy(
-                    { voice -> if (voice.isNetworkConnectionRequired) 1 else 0 },
-                    { voice -> voice.locale.toLanguageTag() },
-                    { voice -> voice.name }
-                )
-            ).forEach { voice ->
-                val languageFilter = args.language?.lowercase()
-                val voiceLanguage = voice.locale.toLanguageTag().lowercase()
-                
-                // Skip if already seen (avoid duplicates)
-                if (voice.name in seenIds) {
-                    return@forEach
-                }
-                
-                if (languageFilter == null || voiceLanguage.startsWith(languageFilter)) {
-                    seenIds.add(voice.name)
-                    
-                    val voiceObj = JSObject()
-                    voiceObj.put("id", voice.name)
-                    // Create friendly display name from voice identifier
-                    voiceObj.put("name", formatVoiceDisplayName(voice))
-                    voiceObj.put("language", voice.locale.toLanguageTag())
-                    voicesArray.put(voiceObj)
-                }
-            }
-            
-            Log.d(TAG, "  Returning ${voicesArray.length()} voices")
-            val ret = JSObject()
-            ret.put("voices", voicesArray)
-            invoke.resolve(ret)
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to get voices: ${e.message}", e)
-            invoke.reject("Failed to get voices: ${e.message}")
-        }
-    }
-    
-    private fun formatVoiceDisplayName(voice: Voice): String {
-        val locale = voice.locale
-        val language = locale.displayLanguage
-        val country = if (locale.country.isNotEmpty()) locale.displayCountry else null
-        val quality = if (voice.name.contains("-local")) "Local" 
-                     else if (voice.name.contains("-network")) "Network" 
-                     else ""
-        
-        return buildString {
-            append(language)
-            if (country != null && country.isNotEmpty()) {
-                append(" ($country)")
-            }
-            if (quality.isNotEmpty()) {
-                append(" - $quality")
-            }
-        }
+        invoke.resolve(JSObject().put("voices", array))
     }
 
     @Command
     fun isSpeaking(invoke: Invoke) {
-        Log.d(TAG, "isSpeaking() CALLED")
-        try {
-            val speaking = tts?.isSpeaking ?: false
-            Log.d(TAG, "  Speaking: $speaking")
-            val ret = JSObject()
-            ret.put("speaking", speaking)
-            invoke.resolve(ret)
-        } catch (e: Exception) {
-            Log.e(TAG, "Failed to check speaking status: ${e.message}", e)
-            invoke.reject("Failed to check speaking status: ${e.message}")
-        }
+        invoke.resolve(JSObject().put("speaking", engine?.isSpeaking ?: false))
     }
-    
+
     @Command
     fun isInitialized(invoke: Invoke) {
-        Log.d(TAG, "isInitialized() CALLED")
-        val ret = JSObject()
-        ret.put("initialized", isInitialized)
-        ret.put("voiceCount", tts?.voices?.size ?: 0)
-        invoke.resolve(ret)
+        invoke.resolve(
+            JSObject()
+                .put("initialized", ready)
+                .put("voiceCount", if (ready) cachedVoices.size else 0)
+        )
+    }
+
+    @Command
+    fun previewVoice(invoke: Invoke) {
+        val args = invoke.parseArgs(PreviewVoiceArgs::class.java)
+        args.validate()?.let { return invoke.reject(it) }
+
+        val engine = this.engine
+        if (!ready || engine == null) return invoke.reject("TTS not initialized")
+
+        // Unlike speak(), no fallback: hearing this exact voice is the point of the call.
+        val voice = engine.voices.orEmpty().firstOrNull { it.name == args.voiceId }
+            ?: return invoke.resolve(
+                JSObject()
+                    .put("success", false)
+                    .put("warning", "Voice '${args.voiceId}' not found")
+            )
+
+        focus.request()
+        engine.stop()
+        engine.voice = voice
+        engine.setSpeechRate(1.0f)
+        engine.setPitch(1.0f)
+
+        val utteranceId = nextUtteranceId("preview")
+        if (engine.speak(args.sampleText(), TextToSpeech.QUEUE_FLUSH, null, utteranceId)
+            != TextToSpeech.SUCCESS
+        ) {
+            focus.release()
+            return invoke.reject("Failed to preview voice - the TTS engine rejected the request.")
+        }
+
+        watchProgress(engine, utteranceId)
+        invoke.resolve(
+            JSObject().put("success", true).put("utteranceId", utteranceId)
+        )
     }
 
     @Command
     fun pauseSpeaking(invoke: Invoke) {
-        val ret = JSObject()
-        ret.put("success", false)
-        ret.put("reason", "Pause is not supported on Android")
-        invoke.resolve(ret)
+        invoke.resolve(unsupported("Pause is not supported on Android"))
     }
 
     @Command
     fun resumeSpeaking(invoke: Invoke) {
-        val ret = JSObject()
-        ret.put("success", false)
-        ret.put("reason", "Resume is not supported on Android")
-        invoke.resolve(ret)
-    }
-
-
-    @Command
-    fun previewVoice(invoke: Invoke) {
-        Log.i(TAG, "previewVoice() CALLED")
-        val args = invoke.parseArgs(PreviewVoiceArgs::class.java)
-        
-        // Validate inputs
-        InputValidator.validateVoiceId(args.voiceId)?.let { error ->
-            invoke.reject(error)
-            return
-        }
-        args.text?.let { text ->
-            InputValidator.validateText(text)?.let { error ->
-                invoke.reject(error)
-                return
-            }
-        }
-        
-        Log.d(TAG, "  VoiceId: ${args.voiceId}")
-        Log.d(TAG, "  Sample text: \"${args.sampleText().take(30)}...\"")
-        
-        if (!isInitialized) {
-            Log.w(TAG, "  TTS not initialized")
-            invoke.reject("TTS not initialized")
-            return
-        }
-        
-        try {
-            tts?.let { engine ->
-                requestAudioFocus()
-                
-                engine.stop()
-                Log.d(TAG, "  Stopped current speech")
-                
-                val voices = engine.voices ?: emptySet()
-                val selectedVoice = voices.find { it.name == args.voiceId }
-                
-                if (selectedVoice != null) {
-                    engine.voice = selectedVoice
-                    Log.d(TAG, "  Voice set: ${selectedVoice.name}")
-                } else {
-                    Log.w(TAG, "  Voice not found: ${args.voiceId}")
-                    val ret = JSObject()
-                    ret.put("success", false)
-                    ret.put("warning", "Voice '${args.voiceId}' not found")
-                    invoke.resolve(ret)
-                    return
-                }
-
-                if (engineParams.needsRate(1.0f)) engine.setSpeechRate(1.0f)
-                if (engineParams.needsPitch(1.0f)) engine.setPitch(1.0f)
-
-                val utteranceId = "preview_${System.currentTimeMillis()}"
-                lastUtteranceId = utteranceId
-
-                engine.speak(args.sampleText(), TextToSpeech.QUEUE_FLUSH, null, utteranceId)
-                Log.d(TAG, "  Preview started with utterance: $utteranceId")
-                
-                val ret = JSObject()
-                ret.put("success", true)
-                invoke.resolve(ret)
-            } ?: run {
-                Log.e(TAG, "  TTS engine is null")
-                invoke.reject("TTS not initialized")
-            }
-        } catch (e: Exception) {
-            Log.e(TAG, "Error previewing voice: ${e.message}", e)
-            invoke.reject("Failed to preview voice: ${e.message}")
-        }
+        invoke.resolve(unsupported("Resume is not supported on Android"))
     }
 
     @Command
     fun setBackgroundBehavior(invoke: Invoke) {
-        val args = invoke.parseArgs(SetBackgroundBehaviorArgs::class.java)
-        continueInBackground = args.continueInBackground
-        Log.d(TAG, "setBackgroundBehavior() continueInBackground=$continueInBackground")
-        val ret = JSObject()
-        ret.put("success", true)
-        invoke.resolve(ret)
+        continueInBackground = invoke.parseArgs(SetBackgroundBehaviorArgs::class.java)
+            .continueInBackground
+        invoke.resolve(JSObject().put("success", true))
     }
 
     @Command
     fun setupEventRelay(invoke: Invoke) {
-        val args = invoke.parseArgs(SetupEventRelayArgs::class.java)
-        eventChannel = args.channel
-        Log.d(TAG, "setupEventRelay() channel registered")
+        events.connect(invoke.parseArgs(SetupEventRelayArgs::class.java).channel)
         invoke.resolve()
     }
+    
+    private fun startSpeaking(invoke: Invoke, args: SpeakArgs) {
+        val engine = this.engine ?: return failSpeak(invoke, "TTS not initialized")
 
-    /**
-     * Emit a TTS event via the Rust relay channel.
-     * Rust receives it and re-emits via app.emit("tts://<eventType>") so that
-     * JS listen("tts://speech:finish") works uniformly on every platform.
-     */
-    private fun emitEvent(
-        eventType: String,
-        id: String? = null,
-        error: String? = null,
-        interrupted: Boolean? = null,
-        reason: String? = null
-    ) {
-        if (eventChannel == null) {
-            Log.w(TAG, "emitEvent($eventType) — eventChannel is NULL, register_listener was not called yet")
-            return
+        try {
+            focus.request()
+
+            val voices = refreshVoiceCache()
+            if (voices.isEmpty()) {
+                // No voices and no cache means the engine is in a state it will not report
+                // as an error. Requeue and rebuild it rather than speaking into the void.
+                focus.release()
+                if (!pending.add(invoke, args)) {
+                    invoke.reject("TTS engine is temporarily unavailable. Please try again.")
+                }
+                restart()
+                return
+            }
+
+            val warning = when (val selection = selectVoice(engine, args, voices)) {
+                is VoiceSelection.Rejected -> return failSpeak(invoke, selection.message)
+                is VoiceSelection.Ok -> selection.warning
+            }
+            applyParameters(engine, args)
+
+            val utteranceId = nextUtteranceId("tts")
+            val queueMode =
+                if (args.flushes()) TextToSpeech.QUEUE_FLUSH else TextToSpeech.QUEUE_ADD
+            val params = volumeParams(args.volume)
+
+            if (engine.speak(args.text, queueMode, params, utteranceId) != TextToSpeech.SUCCESS) {
+                return failSpeak(
+                    invoke,
+                    "The TTS engine refused to speak. It may have lost its voice " +
+                        "configuration - try again, or select a different voice.",
+                )
+            }
+
+            if (args.flushes()) watchProgress(engine, utteranceId)
+
+            invoke.resolve(
+                JSObject()
+                    .put("success", true)
+                    .put("utteranceId", utteranceId)
+                    .apply { warning?.let { put("warning", it) } }
+            )
+        } catch (e: Exception) {
+            Log.e(TAG, "speak failed", e)
+            failSpeak(invoke, "Failed to speak: ${e.message}")
         }
-        val data = JSObject()
-        data.put("eventType", eventType)
-        id?.let { data.put("id", it) }
-        error?.let { data.put("error", it) }
-        interrupted?.let { data.put("interrupted", it) }
-        reason?.let { data.put("reason", it) }
-        eventChannel?.send(data)
     }
 
-    private fun parseLocale(languageTag: String): Locale {
-        Log.d(TAG, "parseLocale($languageTag)")
-        return if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.LOLLIPOP) {
-            Locale.forLanguageTag(languageTag)
+    /** Points the engine at the requested voice or language. */
+    private fun selectVoice(
+        engine: TextToSpeech,
+        args: SpeakArgs,
+        voices: List<VoiceInfo>,
+    ): VoiceSelection {
+        val requestedId = args.requestedVoiceId()
+        if (requestedId != null) return selectById(engine, requestedId, voices)
+
+        val requestedLanguage = args.requestedLanguage()
+        if (requestedLanguage != null) return selectByLanguage(engine, requestedLanguage)
+
+        if (engine.voice == null) {
+            VoiceCatalog.defaultVoice(voices)?.let { setVoice(engine, it.id) }
+        }
+        return VoiceSelection.Ok()
+    }
+
+    private fun selectById(
+        engine: TextToSpeech,
+        requestedId: String,
+        voices: List<VoiceInfo>,
+    ): VoiceSelection {
+        val selected = voices.firstOrNull { it.id == requestedId }
+
+        if (selected != null && !selected.isUsable()) {
+            // getVoices() never offered this voice; speaking with it produces silence.
+            return VoiceSelection.Rejected(
+                "Voice '$requestedId' is missing its language data and cannot speak."
+            )
+        }
+
+        if (selected != null) {
+            setVoice(engine, selected.id)
+            return VoiceSelection.Ok()
+        }
+
+        val fallback = VoiceCatalog.fallbackFor(voices.filter { it.isUsable() }, requestedId)
+            ?: return VoiceSelection.Ok("Voice '$requestedId' not found, using default voice")
+
+        setVoice(engine, fallback.id)
+        return VoiceSelection.Ok(
+            "Voice '$requestedId' not available, using '${fallback.id}' instead"
+        )
+    }
+
+    private fun selectByLanguage(engine: TextToSpeech, language: String): VoiceSelection {
+        val result = engine.setLanguage(Locale.forLanguageTag(language))
+        val supported = result != TextToSpeech.LANG_MISSING_DATA &&
+            result != TextToSpeech.LANG_NOT_SUPPORTED
+
+        return if (supported) {
+            VoiceSelection.Ok()
         } else {
-            val parts = languageTag.split("-", "_")
-            when (parts.size) {
-                1 -> Locale(parts[0])
-                2 -> Locale(parts[0], parts[1])
-                else -> Locale(parts[0], parts[1], parts[2])
-            }
+            VoiceSelection.Ok("Language '$language' not supported, using default language")
         }
     }
 
-    fun cleanup() {
-        Log.d(TAG, "cleanup() CALLED")
-        releaseAudioFocus()
-        tts?.stop()
-        tts?.shutdown()
-        tts = null
-        isInitialized = false
-        Log.d(TAG, "  TTS resources released")
+    /** The engine only accepts its own voice type, so the chosen ID is resolved once more. */
+    private fun setVoice(engine: TextToSpeech, id: String) {
+        engine.voices.orEmpty().firstOrNull { it.name == id }?.let { engine.voice = it }
     }
-    
-    override fun onPause() {
-        super.onPause()
-        Log.d(TAG, "onPause() CALLED (continueInBackground=$continueInBackground)")
-        isForeground = false
-        if (tts?.isSpeaking == true) {
-            if (continueInBackground) {
-                // Continue speaking — TTS engine runs as a system service in background.
-                // No event emitted: speech is not paused, no state change to report.
-                Log.d(TAG, "  App going to background while speaking — continuing in background")
-            } else {
-                // User opted out of background audio. Android cannot pause, so stop instead —
-                // the utterance also emits speech:cancel through the progress listener.
-                Log.d(TAG, "  App going to background while speaking — stopping (continueInBackground=false)")
-                tts?.stop()
-                emitEvent("speech:backgroundPause", reason = "app_paused")
-            }
+
+    private fun applyParameters(engine: TextToSpeech, args: SpeakArgs) {
+        // Rate and pitch are engine-global and persist across utterances, so both are set
+        // every time; skipping one leaks the previous call's value into this one. Android's
+        // scale already matches the plugin's, so the values pass through unchanged.
+        engine.setSpeechRate(args.rate)
+        engine.setPitch(args.pitch)
+    }
+
+    /** Volume is per-utterance, unlike rate and pitch. */
+    private fun volumeParams(volume: Float): Bundle? =
+        if (volume == 1.0f) {
+            null
+        } else {
+            Bundle().apply { putFloat(TextToSpeech.Engine.KEY_PARAM_VOLUME, volume) }
         }
+
+    private fun watchProgress(engine: TextToSpeech, utteranceId: String) {
+        poller.watch(engine, utteranceId, events) { utteranceId == currentUtteranceId }
     }
-    
-    override fun onResume() {
-        super.onResume()
-        Log.d(TAG, "onResume() CALLED")
-        isForeground = true
+
+    private fun nextUtteranceId(prefix: String): String =
+        "${prefix}_${System.currentTimeMillis()}".also { currentUtteranceId = it }
+
+    /** Rejects a speak that already took audio focus. */
+    private fun failSpeak(invoke: Invoke, message: String) {
+        focus.release()
+        invoke.reject(message)
     }
-    
-    override fun onDestroy() {
-        Log.d(TAG, "onDestroy() CALLED")
-        super.onDestroy()
-        cleanup()
+
+    private fun refreshVoiceCache(): List<VoiceInfo> {
+        val engine = this.engine ?: return cachedVoices
+        val native = engine.voices
+
+        if (native.isNullOrEmpty()) return cachedVoices
+
+        cachedVoices = native.map { VoiceCatalog.from(it, engine) }
+        return cachedVoices
     }
+
+    private fun describe(errorCode: Int): String = when (errorCode) {
+        TextToSpeech.ERROR_INVALID_REQUEST -> "Invalid request"
+        TextToSpeech.ERROR_NETWORK -> "Network error"
+        TextToSpeech.ERROR_NETWORK_TIMEOUT -> "Network timeout"
+        TextToSpeech.ERROR_NOT_INSTALLED_YET -> "TTS not installed"
+        TextToSpeech.ERROR_OUTPUT -> "Output error"
+        TextToSpeech.ERROR_SERVICE -> "Service error"
+        TextToSpeech.ERROR_SYNTHESIS -> "Synthesis error"
+        else -> "Unknown error ($errorCode)"
+    }
+
+    private fun unsupported(reason: String): JSObject =
+        JSObject().put("success", false).put("reason", reason)
+
+    private companion object {
+        const val INIT_FAILED_MESSAGE =
+            "TTS engine failed to initialize on this device. " +
+                "Install a text-to-speech engine in Settings > Accessibility."
+    }
+}
+
+/** The outcome of pointing the engine at a voice, before anything is spoken. */
+sealed interface VoiceSelection {
+    /** The engine is configured. [warning] is set when a substitute voice was used. */
+    data class Ok(val warning: String? = null) : VoiceSelection
+
+    /** Nothing can be spoken; [message] explains why. */
+    data class Rejected(val message: String) : VoiceSelection
 }

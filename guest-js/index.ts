@@ -1,304 +1,107 @@
+/**
+ * Native text-to-speech for Tauri 2.
+ *
+ * @module
+ */
+
 import { invoke } from "@tauri-apps/api/core";
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
-import type { Voice } from "./bindings/Voice";
+
 import type { PauseResumeResponse } from "./bindings/PauseResumeResponse";
-import type { SpeakOptions } from "./bindings/SpeakOptions";
 import type { PreviewVoiceOptions } from "./bindings/PreviewVoiceOptions";
+import type { SpeakOptions } from "./bindings/SpeakOptions";
+import type { SpeakResponse } from "./bindings/SpeakResponse";
+import type { Voice } from "./bindings/Voice";
+import {
+  DEFAULT_QUEUE_MODE,
+  type SpeechEvent,
+  type SpeechEventType,
+} from "./types";
 
-export type { QueueMode } from "./bindings/QueueMode";
-export type { Voice } from "./bindings/Voice";
-export type { PauseResumeResponse } from "./bindings/PauseResumeResponse";
-export type { SpeakOptions } from "./bindings/SpeakOptions";
-export type { PreviewVoiceOptions } from "./bindings/PreviewVoiceOptions";
+export * from "./types";
 
-export type TtsErrorCode =
-  | "IO_ERROR"
-  | "PLUGIN_INVOKE_ERROR"
-  | "TTS_ENGINE_ERROR"
-  | "MUTEX_POISONED"
-  | "OPERATION_FAILED"
-  | "EMPTY_TEXT"
-  | "TEXT_TOO_LONG"
-  | "VOICE_ID_TOO_LONG"
-  | "INVALID_VOICE_ID"
-  | "LANGUAGE_TOO_LONG";
-
-export interface TtsError {
-  /** Error code for programmatic handling */
-  code: TtsErrorCode;
-  /** Human-readable error message */
-  message: string;
+/**
+ * `JSON.stringify` turns `NaN` and `Infinity` into `null`, which would read as "unset". A
+ * slider that momentarily reads `NaN` should fall back to the documented default here,
+ * where the intent is still visible.
+ */
+function finiteOr(value: number | null | undefined, fallback: number): number {
+  return typeof value === "number" && Number.isFinite(value) ? value : fallback;
 }
 
-export function isTtsError(error: unknown): error is TtsError {
-  return typeof error === "object" && error !== null && "code" in error && "message" in error;
-}
+let relayRegistration: Promise<void> | null = null;
 
-export interface SpeechEvent {
-  /** Unique identifier for the utterance (if available) */
-  id?: string;
-  /** Event type description */
-  eventType?: string;
-  /** Error message (for error events) */
-  error?: string;
-  /** Whether speech was interrupted */
-  interrupted?: boolean;
-  /** Reason for the event (e.g. "audio_focus_lost", "app_paused") */
-  reason?: string;
-}
-
-export type SpeechEventType =
-  | "speech:start"
-  | "speech:finish"
-  | "speech:cancel"
-  | "speech:pause"
-  | "speech:resume"
-  | "speech:error"
-  | "speech:interrupted"
-  | "speech:backgroundPause";
-
-// Singleton promise: ensures register_listener is only invoked once per page load.
-// On mobile this sets up the native → Rust → JS event relay channel.
-// On desktop it is a no-op that resolves immediately.
-let _relayRegistered: Promise<void> | null = null;
+/**
+ * Registers the native event relay exactly once per page load. On mobile this hands a
+ * channel to the native plugin; on desktop it resolves immediately.
+ */
 function ensureRelayRegistered(): Promise<void> {
-  if (!_relayRegistered) {
-    _relayRegistered = invoke<void>("plugin:tts|register_listener").catch((e) => {
-      _relayRegistered = null; // allow retry on next call
-      throw e;
-    });
-  }
-  return _relayRegistered;
+  relayRegistration ??= invoke<void>("plugin:tts|register_listener").catch(
+    (error) => {
+      relayRegistration = null;
+      throw error;
+    },
+  );
+  return relayRegistration;
 }
 
 /**
- * Listen for TTS speech events
+ * Speaks `text`, resolving once the engine accepts the utterance.
  *
- * @param eventType - The type of speech event to listen for
- * @param callback - Function called when the event occurs
- * @returns Promise that resolves to an unlisten function
+ * Check `warning` on the result: an uninstalled voice still speaks, using the system
+ * default. Use `utteranceId` to match this call against its lifecycle events.
  *
- * @example
- * ```typescript
- * import { onSpeechEvent } from "tauri-plugin-tts-api";
- *
- * const unlisten = await onSpeechEvent("speech:finish", (event) => {
- *   console.log("Speech finished:", event.id);
- * });
- *
- * // Later, stop listening
- * unlisten();
- * ```
- */
-export async function onSpeechEvent(
-  eventType: SpeechEventType,
-  callback: (event: SpeechEvent) => void,
-): Promise<UnlistenFn> {
-  // Ensure the native relay channel is registered before subscribing.
-  // On mobile this calls plugin:tts|register_listener which passes a Channel
-  // to the native plugin so it can forward events via app.emit().
-  // On desktop this is a no-op.
-  await ensureRelayRegistered();
-  return listen<SpeechEvent>(`tts://${eventType}`, (e) => callback(e.payload));
-}
-
-/**
- * Speak the given text using text-to-speech
- *
- * @param options - The speak options including text and optional parameters
- * @returns Promise that resolves when speech has started
- * @throws TtsError if validation fails or TTS operation fails
+ * @throws A {@link TtsError} if validation fails or the engine refuses the request.
  *
  * @example
  * ```typescript
- * import { speak } from "tauri-plugin-tts-api";
- *
- * // Simple usage
  * await speak({ text: "Hello, world!" });
+ * await speak({ text: "Olá!", language: "pt-BR", rate: 1.2 });
  *
- * // With options
- * await speak({
- *   text: "Olá, mundo!",
- *   language: "pt-BR",
- *   rate: 0.8,
- *   pitch: 1.2,
- *   volume: 1.0
- * });
- *
- * // Queue mode - add to queue instead of interrupting
- * await speak({ text: "First sentence" });
- * await speak({ text: "Second sentence", queueMode: "add" });
+ * const { warning } = await speak({ text: "Hi", voiceId: savedId });
+ * if (warning) console.warn(warning);
  * ```
  */
-export async function speak(options: SpeakOptions): Promise<void> {
-  await invoke("plugin:tts|speak", {
+export async function speak(options: SpeakOptions): Promise<SpeakResponse> {
+  return invoke<SpeakResponse>("plugin:tts|speak", {
     payload: {
       text: options.text,
       language: options.language ?? null,
       voiceId: options.voiceId ?? null,
-      rate: options.rate ?? 1.0,
-      pitch: options.pitch ?? 1.0,
-      volume: options.volume ?? 1.0,
-      queueMode: options.queueMode ?? "flush",
+      rate: finiteOr(options.rate, 1.0),
+      pitch: finiteOr(options.pitch, 1.0),
+      volume: finiteOr(options.volume, 1.0),
+      queueMode: options.queueMode ?? DEFAULT_QUEUE_MODE,
     },
   });
 }
 
-/**
- * Stop any ongoing speech
- *
- * @example
- * ```typescript
- * import { stop } from "tauri-plugin-tts-api";
- *
- * await stop();
- * ```
- */
+/** Stops the current utterance and clears anything queued behind it. */
 export async function stop(): Promise<void> {
   await invoke("plugin:tts|stop");
 }
 
 /**
- * Get available voices, optionally filtered by language
- *
- * @param language - Optional language code to filter voices
- * @returns Array of available voices
- *
- * @example
- * ```typescript
- * import { getVoices } from "tauri-plugin-tts-api";
- *
- * // Get all voices
- * const allVoices = await getVoices();
- *
- * // Get only English voices
- * const englishVoices = await getVoices("en");
- *
- * // Get only Brazilian Portuguese voices
- * const ptBrVoices = await getVoices("pt-BR");
- * ```
+ * Lists installed voices, optionally filtered by locale prefix: `"pt"` matches both `pt-BR`
+ * and `pt-PT`.
  */
 export async function getVoices(language?: string): Promise<Voice[]> {
-  const response = await invoke<{ voices: Voice[] }>("plugin:tts|get_voices", {
+  const { voices } = await invoke<{ voices: Voice[] }>("plugin:tts|get_voices", {
     payload: { language: language ?? null },
   });
-  return response.voices;
+  return voices;
 }
 
 /**
- * Check if TTS is currently speaking
+ * Speaks a short sample in `voiceId`, at default rate, pitch and volume.
  *
- * @returns True if speech is in progress
- *
- * @example
- * ```typescript
- * import { isSpeaking, stop } from "tauri-plugin-tts-api";
- *
- * if (await isSpeaking()) {
- *   await stop();
- * }
- * ```
+ * Resolves with `success: false` when the voice is not installed. Unlike {@link speak} it
+ * does not fall back to another voice, since hearing this one is the point of the call.
  */
-export async function isSpeaking(): Promise<boolean> {
-  const response = await invoke<{ speaking: boolean }>("plugin:tts|is_speaking");
-  return response.speaking;
-}
-
-/**
- * Check if TTS engine is initialized and ready
- *
- * On mobile platforms, TTS initialization is asynchronous. Use this
- * to wait for the engine to be ready before calling getVoices().
- *
- * @returns Object with initialized status and voice count
- *
- * @example
- * ```typescript
- * import { isInitialized, getVoices } from "tauri-plugin-tts-api";
- *
- * // Wait for TTS to be ready
- * const waitForTts = async () => {
- *   for (let i = 0; i < 10; i++) {
- *     const status = await isInitialized();
- *     if (status.initialized && status.voiceCount > 0) {
- *       return true;
- *     }
- *     await new Promise(r => setTimeout(r, 500));
- *   }
- *   return false;
- * };
- *
- * if (await waitForTts()) {
- *   const voices = await getVoices();
- * }
- * ```
- */
-export async function isInitialized(): Promise<{
-  initialized: boolean;
-  voiceCount: number;
-}> {
-  return invoke<{ initialized: boolean; voiceCount: number }>("plugin:tts|is_initialized");
-}
-
-/**
- * Pause the current speech (iOS only - Android/Desktop not supported)
- *
- * @returns Promise with success status and optional reason
- *
- * @example
- * ```typescript
- * import { pauseSpeaking, resumeSpeaking } from "tauri-plugin-tts-api";
- *
- * const result = await pauseSpeaking();
- * if (result.success) {
- *   // Speech is paused
- *   await resumeSpeaking();
- * } else {
- *   console.log("Cannot pause:", result.reason);
- * }
- * ```
- */
-export async function pauseSpeaking(): Promise<PauseResumeResponse> {
-  return await invoke<PauseResumeResponse>("plugin:tts|pause_speaking");
-}
-
-/**
- * Resume paused speech (iOS only - Android/Desktop not supported)
- *
- * @returns Promise with success status and optional reason
- */
-export async function resumeSpeaking(): Promise<PauseResumeResponse> {
-  return await invoke<PauseResumeResponse>("plugin:tts|resume_speaking");
-}
-
-/**
- * Preview a voice with sample text
- *
- * Useful for letting users hear what a voice sounds like before selecting it.
- * Uses default rate, pitch, and volume settings.
- *
- * @param options - The preview options including voiceId and optional text
- * @returns Promise that resolves when preview has started
- *
- * @example
- * ```typescript
- * import { getVoices, previewVoice } from "tauri-plugin-tts-api";
- *
- * // Get available voices
- * const voices = await getVoices();
- *
- * // Preview a specific voice
- * await previewVoice({ voiceId: voices[0].id });
- *
- * // Preview with custom text
- * await previewVoice({
- *   voiceId: voices[0].id,
- *   text: "Testing this voice!"
- * });
- * ```
- */
-export async function previewVoice(options: PreviewVoiceOptions): Promise<void> {
-  await invoke("plugin:tts|preview_voice", {
+export async function previewVoice(
+  options: PreviewVoiceOptions,
+): Promise<SpeakResponse> {
+  return invoke<SpeakResponse>("plugin:tts|preview_voice", {
     payload: {
       voiceId: options.voiceId,
       text: options.text ?? null,
@@ -306,32 +109,79 @@ export async function previewVoice(options: PreviewVoiceOptions): Promise<void> 
   });
 }
 
+export async function isSpeaking(): Promise<boolean> {
+  const { speaking } = await invoke<{ speaking: boolean }>(
+    "plugin:tts|is_speaking",
+  );
+  return speaking;
+}
+
 /**
- * Set whether TTS should continue speaking when the app goes to background or the screen locks.
- *
- * When `continueInBackground` is `true` (default), speech continues uninterrupted.
- * When `false`, speech is paused when the app goes to background and a `speech:backgroundPause`
- * event is emitted.
- *
- * Desktop: no-op (always resolves successfully).
+ * Reports whether the engine is ready. Mobile initializes asynchronously, so poll this
+ * before calling {@link getVoices} on a cold start.
  *
  * @example
  * ```typescript
- * import { setBackgroundBehavior } from "tauri-plugin-tts-api";
- *
- * // Pause speech when screen locks (e.g., app only makes sense in foreground)
- * await setBackgroundBehavior({ continueInBackground: false });
- *
- * // Allow speech to continue in background (default)
- * await setBackgroundBehavior({ continueInBackground: true });
+ * async function waitForTts(attempts = 10): Promise<boolean> {
+ *   for (let i = 0; i < attempts; i++) {
+ *     const { initialized, voiceCount } = await isInitialized();
+ *     if (initialized && voiceCount > 0) return true;
+ *     await new Promise((resolve) => setTimeout(resolve, 500));
+ *   }
+ *   return false;
+ * }
  * ```
+ */
+export async function isInitialized(): Promise<{
+  initialized: boolean;
+  voiceCount: number;
+}> {
+  return invoke("plugin:tts|is_initialized");
+}
+
+/**
+ * Pauses the current utterance. iOS only; desktop and Android resolve with
+ * `success: false` and a `reason`, since neither engine can pause.
+ */
+export async function pauseSpeaking(): Promise<PauseResumeResponse> {
+  return invoke<PauseResumeResponse>("plugin:tts|pause_speaking");
+}
+
+/** Resumes a paused utterance. iOS only — see {@link pauseSpeaking}. */
+export async function resumeSpeaking(): Promise<PauseResumeResponse> {
+  return invoke<PauseResumeResponse>("plugin:tts|resume_speaking");
+}
+
+/**
+ * Controls what happens when the app backgrounds or the screen locks.
+ *
+ * With `false`, speech stops and `speech:backgroundPause` is emitted. Mobile only; desktop
+ * resolves without doing anything.
  */
 export async function setBackgroundBehavior(options: {
   continueInBackground: boolean;
 }): Promise<void> {
   await invoke("plugin:tts|set_background_behavior", {
-    payload: {
-      continueInBackground: options.continueInBackground,
-    },
+    payload: { continueInBackground: options.continueInBackground },
   });
+}
+
+/**
+ * Subscribes to a lifecycle event. Call the returned function to stop listening.
+ *
+ * @example
+ * ```typescript
+ * const unlisten = await onSpeechEvent("speech:finish", (event) => {
+ *   console.log("finished", event.id);
+ * });
+ * ```
+ */
+export async function onSpeechEvent(
+  eventType: SpeechEventType,
+  handler: (event: SpeechEvent) => void,
+): Promise<UnlistenFn> {
+  await ensureRelayRegistered();
+  return listen<SpeechEvent>(`tts://${eventType}`, (event) =>
+    handler(event.payload),
+  );
 }

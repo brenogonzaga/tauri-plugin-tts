@@ -3,30 +3,26 @@ import type { QueueMode } from "./QueueMode";
 
 export type SpeakOptions = { 
 /**
- * The text to speak (max 10,000 characters)
+ * Text to speak, at most [`crate::validation::MAX_TEXT_LENGTH`] UTF-8 bytes.
  */
 text: string, 
 /**
- * The language/locale code (e.g., "en-US", "pt-BR", "ja-JP")
+ * Locale code such as `en-US`, `pt-BR` or `ja-JP`.
  */
-language: string | null, 
+language?: string | null, 
 /**
- * Specific voice ID to use (from getVoices). Takes priority over language
+ * Voice ID from `getVoices`. Takes priority over `language`.
  */
-voiceId: string | null, 
+voiceId?: string | null, 
 /**
- * Speech rate (0.1 to 4.0, where 1.0 = normal)
+ * Speech rate, 0.1 to 4.0, where 1.0 is the platform's normal.
  */
-rate: number | null, 
+rate?: number | null, 
 /**
- * Pitch (0.5 to 2.0, where 1.0 = normal)
+ * Pitch, 0.5 to 2.0, where 1.0 is the platform's normal.
  */
-pitch: number | null, 
+pitch?: number | null, 
 /**
- * Volume (0.0 to 1.0, where 1.0 = full volume)
+ * Volume, 0.0 to 1.0.
  */
-volume: number | null, 
-/**
- * Queue mode: "flush" (default) or "add"
- */
-queueMode: QueueMode | null, };
+volume?: number | null, queueMode?: QueueMode | null, };

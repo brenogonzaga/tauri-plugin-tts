@@ -108,15 +108,16 @@ export default function App() {
     setError(null);
     try {
       await startSpeechListeners();
-      await speak({
+      const { warning } = await speak({
         text,
-        voiceId: selectedVoiceId || null,
+        voiceId: selectedVoiceId || undefined,
         rate,
         pitch,
         volume,
-        language: null,
-        queueMode: null,
       });
+      // A stale voiceId still speaks, using the system default - surface that rather than
+      // letting the user wonder why the voice they picked is not the one they hear.
+      if (warning) setError(warning);
       setIsSpeaking(true);
     } catch (err) {
       stopSpeechListeners();
@@ -138,7 +139,13 @@ export default function App() {
     setError(null);
     try {
       setSelectedVoiceId(voice.id);
-      await previewVoice({ voiceId: voice.id, text: text.trim() || null });
+      const result = await previewVoice({
+        voiceId: voice.id,
+        text: text.trim() || undefined,
+      });
+      // previewVoice resolves with success: false when the voice is not installed; without
+      // this check the preview is simply silent and looks like a broken button.
+      if (!result.success) setError(result.warning ?? "Voice unavailable");
     } catch (err) {
       setError(isTtsError(err) ? err.message : String(err));
     }

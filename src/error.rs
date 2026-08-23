@@ -1,6 +1,6 @@
 use serde::{ser::Serializer, Serialize};
 
-use crate::models::ValidationError;
+use crate::validation::ValidationError;
 
 pub type Result<T> = std::result::Result<T, Error>;
 

@@ -4,7 +4,7 @@ plugins {
 }
 
 android {
-    namespace = "io.affex.tts"
+    namespace = "com.tts"
     compileSdk = 36
 
     defaultConfig {
@@ -29,6 +29,12 @@ android {
     }
     kotlinOptions {
         jvmTarget = "1.8"
+    }
+}
+
+tasks.withType<Test>().configureEach {
+    testLogging {
+        events("passed", "skipped", "failed")
     }
 }
 

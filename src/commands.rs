@@ -1,85 +1,112 @@
+//! IPC surface. Each command validates nothing itself; it forwards to the platform backend.
+
 use tauri::{command, AppHandle, Runtime};
 
 use crate::models::*;
-use crate::Result;
-use crate::TtsExt;
+use crate::{Result, TtsExt};
 
-/// Speak the given text using text-to-speech
+/// Runs `f` where this platform's synthesizer is safe to drive.
+///
+/// Tauri runs `async` commands on the async runtime's worker threads. On macOS that is the
+/// wrong thread: the backend talks to `AVSpeechSynthesizer` through raw `msg_send!` with no
+/// dispatch of its own. Every other backend is thread-safe, so they skip the hop.
+#[cfg(target_os = "macos")]
+fn on_synthesizer_thread<R, T, F>(app: &AppHandle<R>, f: F) -> Result<T>
+where
+    R: Runtime,
+    T: Send + 'static,
+    F: FnOnce(&AppHandle<R>) -> Result<T> + Send + 'static,
+{
+    let (sender, receiver) = std::sync::mpsc::channel();
+    let app_on_main = app.clone();
+
+    app.run_on_main_thread(move || {
+        let _ = sender.send(f(&app_on_main));
+    })
+    .map_err(|e| crate::Error::OperationFailed(format!("could not reach the main thread: {e}")))?;
+
+    receiver.recv().map_err(|_| {
+        crate::Error::OperationFailed("the TTS main-thread task did not run".to_string())
+    })?
+}
+
+#[cfg(not(target_os = "macos"))]
+fn on_synthesizer_thread<R, T, F>(app: &AppHandle<R>, f: F) -> Result<T>
+where
+    R: Runtime,
+    T: Send + 'static,
+    F: FnOnce(&AppHandle<R>) -> Result<T> + Send + 'static,
+{
+    f(app)
+}
+
 #[command]
 pub(crate) async fn speak<R: Runtime>(
     app: AppHandle<R>,
     payload: SpeakRequest,
 ) -> Result<SpeakResponse> {
-    app.tts().speak(payload)
+    on_synthesizer_thread(&app, move |app| app.tts().speak(payload))
 }
 
-/// Stop any ongoing speech
 #[command]
 pub(crate) async fn stop<R: Runtime>(app: AppHandle<R>) -> Result<StopResponse> {
-    app.tts().stop()
+    on_synthesizer_thread(&app, |app| app.tts().stop())
 }
 
-/// Get available voices, optionally filtered by language
 #[command]
 pub(crate) async fn get_voices<R: Runtime>(
     app: AppHandle<R>,
     payload: GetVoicesRequest,
 ) -> Result<GetVoicesResponse> {
-    app.tts().get_voices(payload)
+    on_synthesizer_thread(&app, move |app| app.tts().get_voices(payload))
 }
 
-/// Check if TTS is currently speaking
 #[command]
 pub(crate) async fn is_speaking<R: Runtime>(app: AppHandle<R>) -> Result<IsSpeakingResponse> {
-    app.tts().is_speaking()
+    on_synthesizer_thread(&app, |app| app.tts().is_speaking())
 }
 
-/// Check if TTS engine is initialized and ready
 #[command]
 pub(crate) async fn is_initialized<R: Runtime>(app: AppHandle<R>) -> Result<IsInitializedResponse> {
-    app.tts().is_initialized()
+    on_synthesizer_thread(&app, |app| app.tts().is_initialized())
 }
 
-/// Pause the current speech (mobile only, desktop will return error)
-#[command]
-pub(crate) async fn pause_speaking<R: Runtime>(app: AppHandle<R>) -> Result<PauseResumeResponse> {
-    app.tts().pause_speaking()
-}
-
-/// Resume paused speech (mobile only, desktop will return error)
-#[command]
-pub(crate) async fn resume_speaking<R: Runtime>(app: AppHandle<R>) -> Result<PauseResumeResponse> {
-    app.tts().resume_speaking()
-}
-
-/// Preview a voice by speaking a sample text
 #[command]
 pub(crate) async fn preview_voice<R: Runtime>(
     app: AppHandle<R>,
     payload: PreviewVoiceRequest,
 ) -> Result<SpeakResponse> {
-    app.tts().preview_voice(payload)
+    on_synthesizer_thread(&app, move |app| app.tts().preview_voice(payload))
 }
 
-/// Register the native event relay channel (mobile only, no-op on desktop).
-/// Must be called once before listening with `onSpeechEvent`.
+/// iOS only; desktop and Android answer with `success: false` and a reason.
 #[command]
-pub(crate) async fn register_listener<R: Runtime>(app: AppHandle<R>) -> Result<()> {
-    #[cfg(not(mobile))]
-    let _ = app;
-    #[cfg(mobile)]
-    {
-        let app_clone = app.clone();
-        app.tts().setup_event_relay(&app_clone)?;
-    }
-    Ok(())
+pub(crate) async fn pause_speaking<R: Runtime>(app: AppHandle<R>) -> Result<PauseResumeResponse> {
+    on_synthesizer_thread(&app, |app| app.tts().pause_speaking())
 }
 
-/// Set whether TTS should continue in background when screen locks (mobile only)
+#[command]
+pub(crate) async fn resume_speaking<R: Runtime>(app: AppHandle<R>) -> Result<PauseResumeResponse> {
+    on_synthesizer_thread(&app, |app| app.tts().resume_speaking())
+}
+
+/// Mobile only; a no-op on desktop, which has no background state.
 #[command]
 pub(crate) async fn set_background_behavior<R: Runtime>(
     app: AppHandle<R>,
     payload: SetBackgroundBehaviorRequest,
 ) -> Result<SetBackgroundBehaviorResponse> {
-    app.tts().set_background_behavior(payload)
+    on_synthesizer_thread(&app, move |app| app.tts().set_background_behavior(payload))
+}
+
+/// Registers the native event relay. Mobile calls this once before any event can arrive;
+/// on desktop the plugin emits directly and there is nothing to set up.
+#[command]
+pub(crate) async fn register_listener<R: Runtime>(app: AppHandle<R>) -> Result<()> {
+    #[cfg(mobile)]
+    app.tts().ensure_relay_registered()?;
+    #[cfg(not(mobile))]
+    let _ = app;
+
+    Ok(())
 }

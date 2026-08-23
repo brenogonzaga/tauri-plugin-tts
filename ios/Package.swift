@@ -17,7 +17,8 @@ let package = Package(
             targets: ["tauri-plugin-tts"]),
     ],
     dependencies: [
-        .package(name: "Tauri", path: "../.tauri/tauri-api")
+        .package(name: "Tauri", path: "../.tauri/tauri-api"),
+        .package(name: "TtsCore", path: "Core"),
     ],
     targets: [
         // Targets are the basic building blocks of a package. A target can define a module or a test suite.
@@ -25,8 +26,12 @@ let package = Package(
         .target(
             name: "tauri-plugin-tts",
             dependencies: [
-                .byName(name: "Tauri")
+                .byName(name: "Tauri"),
+                .product(name: "TtsCore", package: "TtsCore"),
             ],
-            path: "Sources")
+            path: "Sources",
+            resources: [
+                .process("PrivacyInfo.xcprivacy")
+            ])
     ]
 )
