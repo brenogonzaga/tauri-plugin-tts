@@ -1,12 +1,15 @@
 package com.tts
 
+import android.content.Context
 import android.media.AudioAttributes
 import android.media.AudioFocusRequest
 import android.media.AudioManager
+import android.media.session.MediaSession
+import android.media.session.PlaybackState
 import android.os.Build
 
 /**
- * Holds audio focus for the duration of an utterance.
+ * Holds audio focus and an active [MediaSession] for the duration of an utterance.
  *
  * Focus is requested as `AUDIOFOCUS_GAIN_TRANSIENT`, not `AUDIOFOCUS_GAIN`: the Google TTS
  * engine runs as a separate service and requests its own focus to play the synthesized
@@ -14,10 +17,15 @@ import android.os.Build
  * listener, which stops the very utterance it was granted for.
  */
 class AudioFocusController(
+    context: Context,
     private val audioManager: AudioManager?,
     private val onLoss: (permanent: Boolean, reason: String) -> Unit,
 ) {
     private var request: AudioFocusRequest? = null
+
+    private val mediaSession = MediaSession(context, "TtsPlugin").apply {
+        setPlaybackState(stoppedState)
+    }
 
     private val listener = AudioManager.OnAudioFocusChangeListener { change ->
         when (change) {
@@ -53,7 +61,12 @@ class AudioFocusController(
             )
         }
 
-        return granted == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+        val ok = granted == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
+        if (ok) {
+            mediaSession.isActive = true
+            mediaSession.setPlaybackState(playingState)
+        }
+        return ok
     }
 
     fun release() {
@@ -64,5 +77,23 @@ class AudioFocusController(
             @Suppress("DEPRECATION")
             audioManager?.abandonAudioFocus(listener)
         }
+
+        mediaSession.setPlaybackState(stoppedState)
+        mediaSession.isActive = false
+    }
+
+    fun destroy() {
+        mediaSession.release()
+    }
+
+    private companion object {
+        val playingState: PlaybackState = PlaybackState.Builder()
+            .setActions(PlaybackState.ACTION_STOP)
+            .setState(PlaybackState.STATE_PLAYING, PlaybackState.PLAYBACK_POSITION_UNKNOWN, 1f)
+            .build()
+
+        val stoppedState: PlaybackState = PlaybackState.Builder()
+            .setState(PlaybackState.STATE_STOPPED, PlaybackState.PLAYBACK_POSITION_UNKNOWN, 0f)
+            .build()
     }
 }

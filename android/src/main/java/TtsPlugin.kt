@@ -30,6 +30,7 @@ class TtsPlugin(private val activity: Activity) : Plugin(activity), TextToSpeech
     }
 
     private val focus = AudioFocusController(
+        activity,
         activity.getSystemService(Context.AUDIO_SERVICE) as? AudioManager,
     ) { _, reason ->
         // Android TTS cannot pause, so stopping is the only way to yield the audio.
@@ -112,6 +113,7 @@ class TtsPlugin(private val activity: Activity) : Plugin(activity), TextToSpeech
     override fun onDestroy(activity: androidx.appcompat.app.AppCompatActivity) {
         super.onDestroy(activity)
         focus.release()
+        focus.destroy()
         engine?.stop()
         engine?.shutdown()
         engine = null
