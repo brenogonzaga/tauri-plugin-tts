@@ -7,6 +7,7 @@ import android.media.AudioManager
 import android.media.session.MediaSession
 import android.media.session.PlaybackState
 import android.os.Build
+import android.util.Log
 
 /**
  * Holds audio focus and an active [MediaSession] for the duration of an utterance.
@@ -23,8 +24,11 @@ class AudioFocusController(
 ) {
     private var request: AudioFocusRequest? = null
 
-    private val mediaSession = MediaSession(context, "TtsPlugin").apply {
-        setPlaybackState(stoppedState)
+    private val mediaSession = try {
+        MediaSession(context, "TtsPlugin").apply { setPlaybackState(stoppedState) }
+    } catch (e: Exception) {
+        Log.e("TtsPlugin", "MediaSession unavailable", e)
+        null
     }
 
     private val listener = AudioManager.OnAudioFocusChangeListener { change ->
@@ -42,12 +46,7 @@ class AudioFocusController(
     fun request(): Boolean {
         val granted = if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             AudioFocusRequest.Builder(AudioManager.AUDIOFOCUS_GAIN_TRANSIENT)
-                .setAudioAttributes(
-                    AudioAttributes.Builder()
-                        .setUsage(AudioAttributes.USAGE_ASSISTANT)
-                        .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
-                        .build()
-                )
+                .setAudioAttributes(speechAttributes)
                 .setOnAudioFocusChangeListener(listener)
                 .build()
                 .also { request = it }
@@ -63,8 +62,8 @@ class AudioFocusController(
 
         val ok = granted == AudioManager.AUDIOFOCUS_REQUEST_GRANTED
         if (ok) {
-            mediaSession.isActive = true
-            mediaSession.setPlaybackState(playingState)
+            mediaSession?.isActive = true
+            mediaSession?.setPlaybackState(playingState)
         }
         return ok
     }
@@ -78,21 +77,32 @@ class AudioFocusController(
             audioManager?.abandonAudioFocus(listener)
         }
 
-        mediaSession.setPlaybackState(stoppedState)
-        mediaSession.isActive = false
+        mediaSession?.setPlaybackState(stoppedState)
+        mediaSession?.isActive = false
     }
 
     fun destroy() {
-        mediaSession.release()
+        mediaSession?.release()
     }
 
     private companion object {
-        val playingState: PlaybackState = PlaybackState.Builder()
+        val speechAttributes: AudioAttributes = AudioAttributes.Builder()
+            .setUsage(
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                    AudioAttributes.USAGE_ASSISTANT
+                } else {
+                    AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE
+                }
+            )
+            .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
+            .build()
+
+        private val playingState: PlaybackState = PlaybackState.Builder()
             .setActions(PlaybackState.ACTION_STOP)
             .setState(PlaybackState.STATE_PLAYING, PlaybackState.PLAYBACK_POSITION_UNKNOWN, 1f)
             .build()
 
-        val stoppedState: PlaybackState = PlaybackState.Builder()
+        private val stoppedState: PlaybackState = PlaybackState.Builder()
             .setState(PlaybackState.STATE_STOPPED, PlaybackState.PLAYBACK_POSITION_UNKNOWN, 0f)
             .build()
     }
