@@ -5,6 +5,40 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.2.0] - 2026-09-07
+
+### Fixed
+
+- **Android**: Fixed a failing TTS engine crashing the host app instead of reporting an init failure ([#14](https://github.com/brenogonzaga/tauri-plugin-tts/issues/14)).
+- **TypeScript**: Fixed `SpeakOptions` and `PreviewVoiceOptions` requiring every field, breaking `strict` compilation of `speak({ text })` and `previewVoice({ voiceId })`.
+- **Android**: Fixed `speak()` hanging forever instead of rejecting when the TTS engine failed to initialize.
+- **Desktop**: Fixed lifecycle events carrying the wrong utterance ID under `queueMode: "add"`.
+- **iOS**: Fixed `rate` saturating at `2.0`, making `2.0`–`4.0` sound identical.
+- **Desktop**: Fixed `rate` values between `0.1` and `0.25` collapsing onto the platform minimum.
+- **All platforms**: `speak()` and `previewVoice()` now resolve with `{ success, warning, utteranceId }` instead of discarding the result, so an unavailable voice can be detected.
+- **Desktop**: Fixed a missing `voiceId`/`language` falling back to the default voice without a `warning`.
+- **Desktop / iOS**: Fixed `speech:error` never being emitted; it was Android-only.
+- **Android**: Fixed audio focus being retained after `speak()`/`previewVoice()` failed before speech started.
+- **Android**: Fixed `previewVoice()` emitting no events on engines where `UtteranceProgressListener` never fires.
+- **iOS**: Fixed a leaked `utteranceIds` entry per `previewVoice()` call on an uninstalled voice.
+- **All platforms**: Fixed `null` `rate`/`pitch`/`volume`/`text` (from `NaN`/`Infinity`) failing with an unclassified error.
+- **Desktop**: Fixed an empty voice list being cached for 60s while speech-dispatcher was still starting.
+- **iOS**: Fixed speech staying "paused" with no event after an interruption ended without `shouldResume`.
+- **Android**: Fixed every voice of a locale reporting the same name.
+
+### Changed
+
+- **macOS**: Synthesizer calls are dispatched to the main thread instead of Tauri's worker threads.
+- **Desktop**: `speech:start` now fires from the engine's `on_utterance_begin` callback, not on queueing.
+- **TypeScript** (Breaking): `speak()` and `previewVoice()` return `Promise<SpeakResponse>` instead of `Promise<void>`; existing `await` calls that ignore the result keep working.
+- Exported `MAX_TEXT_LENGTH`, `RATE_RANGE`, `PITCH_RANGE` and `VOLUME_RANGE` from the JavaScript API.
+- **Android**: Removed two full voice enumerations that ran per `speak()` purely for debug logs.
+
+### Internal
+
+- Split each backend into focused modules (Rust: `validation`, `desktop/`; Android: `Validation`, `SpeechArgs`, `VoiceCatalog`, `AudioFocusController`, `SpeechEvents`, `PendingRequests`, `ProgressPoller`; iOS: a `TtsCore` package plus `SpeechArguments`, `AudioSessionController`, `VoiceProvider`, `UtteranceRegistry`, `SpeechEventRelay`).
+- Replaced the Android and iOS test suites with tests that exercise the extracted logic instead of asserting literals against literals.
+
 ## [0.1.13] - 2026-08-15
 
 ### Fixed
