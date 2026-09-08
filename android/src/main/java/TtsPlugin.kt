@@ -50,7 +50,15 @@ class TtsPlugin(private val activity: Activity) : Plugin(activity), TextToSpeech
     private var cachedVoices: List<VoiceInfo> = emptyList()
 
     init {
-        engine = TextToSpeech(activity, this)
+        engine = createEngine()
+    }
+
+    private fun createEngine(): TextToSpeech? = try {
+        TextToSpeech(activity, this)
+    } catch (e: Exception) {
+        Log.e(TAG, "TTS engine could not be created", e)
+        onInit(TextToSpeech.ERROR)
+        null
     }
 
     override fun onInit(status: Int) {
@@ -130,7 +138,7 @@ class TtsPlugin(private val activity: Activity) : Plugin(activity), TextToSpeech
         initFailed = false
         cachedVoices = emptyList()
         events.reset()
-        engine = TextToSpeech(activity, this)
+        engine = createEngine()
     }
 
     @Command
