@@ -39,7 +39,7 @@
         "pretest": "npm run build"
     },
     "dependencies": {
-        "@tauri-apps/api": "^2.9.1"
+        "@tauri-apps/api": "^2.11.1"
     },
     "devDependencies": {
         "@rollup/plugin-typescript": "^12.0.0",
