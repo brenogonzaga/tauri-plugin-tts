@@ -87,13 +87,7 @@ class AudioFocusController(
 
     private companion object {
         val speechAttributes: AudioAttributes = AudioAttributes.Builder()
-            .setUsage(
-                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
-                    AudioAttributes.USAGE_ASSISTANT
-                } else {
-                    AudioAttributes.USAGE_ASSISTANCE_NAVIGATION_GUIDANCE
-                }
-            )
+            .setUsage(AudioAttributes.USAGE_MEDIA)
             .setContentType(AudioAttributes.CONTENT_TYPE_SPEECH)
             .build()
 
