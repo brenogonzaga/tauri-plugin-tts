@@ -15,7 +15,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `TtsExt::synthesizer()`. iOS and macOS are backed by
   `AVSpeechSynthesizer.write(_:toBufferCallback:)` in `apple/TtsStream.m`
   (compiled by `build.rs`); other platforms report `available == false`.
-- `examples/synth_probe.rs` renders a sentence through it on macOS.
+- `examples/synth_probe.rs` renders a sentence through it on macOS;
+  `examples/synth_stress.rs` runs many concurrent jobs back to back.
+
+### Fixed
+
+- **iOS/macOS**: the buffer-producing synthesizer no longer crashes in
+  `-[AVSpeechSynthesizer processSpeechJobFinished:successful:]`
+  (`EXC_BAD_ACCESS` on the main thread). Each job used to own an
+  `AVSpeechSynthesizer` that was released as soon as its last buffer arrived,
+  while the framework was still finishing the job on the main queue.
+  Synthesizers now live in reusable channels that are never deallocated.
 
 ### Changed
 

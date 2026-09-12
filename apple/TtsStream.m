@@ -18,6 +18,10 @@
 // main run loop — a Tauri app always has one) and hop onto that queue. Rust
 // callbacks are invoked from that queue and must not block (they push into a
 // channel).
+//
+// Lifetime: synthesizers are never deallocated. Each lives in a
+// `TtsStreamChannel` that is reused for job after job — see that class for
+// the framework behaviour that forces this.
 
 #import <AVFoundation/AVFoundation.h>
 #import <Foundation/Foundation.h>
@@ -50,6 +54,7 @@ static dispatch_queue_t tts_stream_queue(void) {
 }
 
 @class TtsStreamJob;
+@class TtsStreamChannel;
 
 /// Live jobs by id. Ids are minted by Rust; a stale id is a no-op.
 static NSMutableDictionary<NSNumber *, TtsStreamJob *> *tts_stream_jobs(void) {
@@ -59,6 +64,17 @@ static NSMutableDictionary<NSNumber *, TtsStreamJob *> *tts_stream_jobs(void) {
         jobs = [NSMutableDictionary dictionary];
     });
     return jobs;
+}
+
+/// Every synthesizer channel ever created, busy or idle. Channels are never
+/// removed — see `TtsStreamChannel` for why they must outlive their jobs.
+static NSMutableArray<TtsStreamChannel *> *tts_stream_channels(void) {
+    static NSMutableArray *channels;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        channels = [NSMutableArray array];
+    });
+    return channels;
 }
 
 /// Convert whatever PCM layout the synthesizer produced into mono float32.
@@ -121,14 +137,40 @@ static NSData *mono_float_samples(AVAudioPCMBuffer *pcm) {
 
 // MARK: - One synthesis job
 
-@interface TtsStreamJob : NSObject <AVSpeechSynthesizerDelegate>
+/// The bookkeeping for one utterance: which channel renders it and whether
+/// Rust has been told it ended. Holds no framework object of its own beyond
+/// the utterance, so its lifetime is free to end with the job.
+@interface TtsStreamJob : NSObject
 @property(nonatomic, readonly) uint64_t jobId;
-@property(nonatomic, strong) AVSpeechSynthesizer *synthesizer;
+@property(nonatomic, strong) AVSpeechUtterance *utterance;
+@property(nonatomic, strong) TtsStreamChannel *channel;
 @property(nonatomic, assign) BOOL ended;
 @property(nonatomic, assign) BOOL cancelled;
 - (instancetype)initWithId:(uint64_t)jobId;
-- (void)startWithUtterance:(AVSpeechUtterance *)utterance;
-- (void)cancel;
+- (void)failWithMessage:(NSString *)message;
+- (void)finish;
+@end
+
+// MARK: - One synthesizer, reused for job after job
+
+/// An `AVSpeechSynthesizer` plus its permanent delegate.
+///
+/// Why synthesizers are reused instead of created per job: the framework
+/// keeps working on a synthesizer on the main queue after it delivered the
+/// last buffer and after the delegate learned the utterance finished
+/// (`TTSSpeechManager` → `-[AVSpeechSynthesizer processSpeechJobFinished:]`).
+/// A synthesizer released from our queue inside that window is a
+/// use-after-free the framework trips over — seen as SIGSEGV in
+/// `processSpeechJobFinished:successful:` on iOS 26. Hence channels are
+/// process-lifetime objects: created on demand, parked when idle, never
+/// deallocated. A channel renders one utterance at a time; it is idle again
+/// once its delegate was told that utterance finished or was cancelled — the
+/// framework's last word about it. A channel whose delegate never hears back
+/// simply stays parked; the next job takes another one.
+@interface TtsStreamChannel : NSObject <AVSpeechSynthesizerDelegate>
+@property(nonatomic, strong, readonly) AVSpeechSynthesizer *synthesizer;
+/// The job being rendered; nil while idle. Written on the stream queue only.
+@property(nonatomic, strong) TtsStreamJob *job;
 @end
 
 @implementation TtsStreamJob
@@ -137,21 +179,52 @@ static NSData *mono_float_samples(AVAudioPCMBuffer *pcm) {
     self = [super init];
     if (self) {
         _jobId = jobId;
-        _synthesizer = [[AVSpeechSynthesizer alloc] init];
-        _synthesizer.delegate = self;
         _ended = NO;
         _cancelled = NO;
     }
     return self;
 }
 
-- (void)startWithUtterance:(AVSpeechUtterance *)utterance {
-    __weak TtsStreamJob *weakSelf = self;
+// Helpers below run on the stream queue.
+
+- (void)failWithMessage:(NSString *)message {
+    if (self.ended) return;
+    rust_tts_stream_on_error(self.jobId, message.UTF8String);
+    [self finish];
+}
+
+- (void)finish {
+    if (self.ended) return;
+    self.ended = YES;
+    rust_tts_stream_on_ended(self.jobId);
+    [tts_stream_jobs() removeObjectForKey:@(self.jobId)];
+}
+
+@end
+
+@implementation TtsStreamChannel
+
+- (instancetype)init {
+    self = [super init];
+    if (self) {
+        _synthesizer = [[AVSpeechSynthesizer alloc] init];
+        _synthesizer.delegate = self;
+    }
+    return self;
+}
+
+/// Stream queue. Hands the utterance to the synthesizer; buffers and the
+/// end of the job come back through `job`.
+- (void)startJob:(TtsStreamJob *)job {
+    self.job = job;
+    job.channel = self;
+    uint64_t jobId = job.jobId;
     // The framework hands us one buffer at a time and — per the docs — an
     // empty buffer once the utterance is complete. The buffer is only
     // guaranteed valid during the callback, so convert here and hand the copy
-    // to the stream queue.
-    [self.synthesizer writeUtterance:utterance
+    // to the stream queue. The block carries the job id, not the job: a
+    // callback for a job that already ended finds nothing and does nothing.
+    [self.synthesizer writeUtterance:job.utterance
                     toBufferCallback:^(AVAudioBuffer *_Nonnull buffer) {
                         AVAudioPCMBuffer *pcm = [buffer isKindOfClass:[AVAudioPCMBuffer class]]
                                                     ? (AVAudioPCMBuffer *)buffer
@@ -171,75 +244,84 @@ static NSData *mono_float_samples(AVAudioPCMBuffer *pcm) {
                             }
                         }
                         dispatch_async(tts_stream_queue(), ^{
-                            TtsStreamJob *job = weakSelf;
-                            if (!job || job.ended) return;
+                            TtsStreamJob *live = tts_stream_jobs()[@(jobId)];
+                            if (!live || live.ended) return;
                             if (failure) {
-                                [job failWithMessage:failure];
+                                [live failWithMessage:failure];
                             } else if (finished) {
-                                [job finish];
+                                [live finish];
                             } else {
                                 uint32_t count = (uint32_t)(mono.length / sizeof(float));
-                                rust_tts_stream_on_audio(job.jobId, (const float *)mono.bytes,
-                                                         count, sampleRate);
+                                rust_tts_stream_on_audio(jobId, (const float *)mono.bytes, count,
+                                                         sampleRate);
                             }
                         });
                     }];
 }
 
-- (void)cancel {
-    dispatch_async(tts_stream_queue(), ^{
-        if (self.ended) return;
-        self.cancelled = YES;
-        [self.synthesizer stopSpeakingAtBoundary:AVSpeechBoundaryImmediate];
-        [self finish];
-    });
+/// Stream queue. Aborts the running utterance; the channel is released for
+/// reuse when the delegate reports the cancellation.
+- (void)cancelJob:(TtsStreamJob *)job {
+    if (job.ended) return;
+    job.cancelled = YES;
+    [self.synthesizer stopSpeakingAtBoundary:AVSpeechBoundaryImmediate];
+    [job finish];
 }
 
-// MARK: Helpers (on the stream queue)
-
-- (void)failWithMessage:(NSString *)message {
-    if (self.ended) return;
-    rust_tts_stream_on_error(self.jobId, message.UTF8String);
-    [self finish];
-}
-
-- (void)finish {
-    if (self.ended) return;
-    self.ended = YES;
-    rust_tts_stream_on_ended(self.jobId);
-    // Release the registry's reference outside the current callback frame so
-    // the synthesizer never deallocates while one of its callbacks is on the
-    // stack.
-    uint64_t jobId = self.jobId;
-    dispatch_async(tts_stream_queue(), ^{
-        [tts_stream_jobs() removeObjectForKey:@(jobId)];
-    });
+/// Stream queue. The framework is done with `utterance`: end its job (a
+/// no-op when the empty buffer already did) and park the channel.
+- (void)utteranceDone:(AVSpeechUtterance *)utterance cancelled:(BOOL)cancelled {
+    TtsStreamJob *job = self.job;
+    if (!job || job.utterance != utterance) {
+        return;
+    }
+    if (cancelled && !job.cancelled && !job.ended) {
+        [job failWithMessage:@"Synthesis was cancelled by the system"];
+    } else {
+        [job finish];
+    }
+    self.job = nil;
+    job.channel = nil;
 }
 
 // MARK: AVSpeechSynthesizerDelegate (main queue)
 
 // Belt and braces: some OS versions have been seen to skip the terminating
 // empty buffer. The delegate's finish/cancel notifications end the job too;
-// whichever arrives first wins, the other is a no-op.
+// whichever arrives first wins, the other is a no-op. Either way only the
+// delegate frees the channel.
 - (void)speechSynthesizer:(AVSpeechSynthesizer *)synthesizer
     didFinishSpeechUtterance:(AVSpeechUtterance *)utterance {
     dispatch_async(tts_stream_queue(), ^{
-        [self finish];
+        [self utteranceDone:utterance cancelled:NO];
     });
 }
 
 - (void)speechSynthesizer:(AVSpeechSynthesizer *)synthesizer
     didCancelSpeechUtterance:(AVSpeechUtterance *)utterance {
     dispatch_async(tts_stream_queue(), ^{
-        if (!self.cancelled && !self.ended) {
-            [self failWithMessage:@"Synthesis was cancelled by the system"];
-        } else {
-            [self finish];
-        }
+        [self utteranceDone:utterance cancelled:YES];
     });
 }
 
 @end
+
+/// Stream queue. An idle channel, or a new one when every existing channel
+/// is busy. The count settles at the host's synthesis concurrency plus one
+/// or two: a channel stays busy until its finish notification has hopped
+/// from the main queue, which a back-to-back job does not wait for.
+static TtsStreamChannel *tts_stream_idle_channel(void) {
+    NSMutableArray<TtsStreamChannel *> *channels = tts_stream_channels();
+    for (TtsStreamChannel *channel in channels) {
+        if (channel.job == nil) {
+            return channel;
+        }
+    }
+    TtsStreamChannel *channel = [[TtsStreamChannel alloc] init];
+    [channels addObject:channel];
+    NSLog(@"[TtsStream] synthesizer #%lu created", (unsigned long)channels.count);
+    return channel;
+}
 
 // MARK: - C ABI (called from Rust)
 
@@ -305,18 +387,20 @@ int32_t tts_stream_start(uint64_t job_id, const char *text, const char *voice_id
             return;
         }
         TtsStreamJob *job = [[TtsStreamJob alloc] initWithId:job_id];
+        job.utterance = utterance;
         jobs[@(job_id)] = job;
-        [job startWithUtterance:utterance];
+        [tts_stream_idle_channel() startJob:job];
     });
     return result;
 }
 
 void tts_stream_cancel(uint64_t job_id) {
-    __block TtsStreamJob *job = nil;
-    dispatch_sync(tts_stream_queue(), ^{
-        job = tts_stream_jobs()[@(job_id)];
+    dispatch_async(tts_stream_queue(), ^{
+        TtsStreamJob *job = tts_stream_jobs()[@(job_id)];
+        if (job) {
+            [job.channel cancelJob:job];
+        }
     });
-    [job cancel];
 }
 
 /// Enumerate the installed voices. `visit` is called once per voice with
